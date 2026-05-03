@@ -83,7 +83,7 @@ impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             scan_workers: 0,
-            metadata_batch_size: 200,
+            metadata_batch_size: 50,
             copy_workers: 2,
         }
     }
