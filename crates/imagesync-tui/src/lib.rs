@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use imagesync_core::config::AppConfig;
+use imagesync_core::config::{AppConfig, RawMode};
 use imagesync_core::engine::ExecuteOptions;
 use imagesync_core::events::{CopyOutcome, EngineEvent, PlannedAction};
 use imagesync_core::mount::{detect_mounts, DetectedMount, MountRank};
@@ -82,6 +82,12 @@ enum Screen {
 
 /// Which field of the destination editor is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavePromptNext {
+    Confirm,
+    StartScan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestField {
     ImagesRoot,
     VideosRoot,
@@ -132,6 +138,10 @@ struct App {
     dest_images_template: String,
     dest_videos_template: String,
     dest_field: DestField,
+
+    // Filters (raw_mode picker on Confirm)
+    raw_mode_disk: RawMode,
+    save_prompt_next: SavePromptNext,
 
     // After Confirm
     chosen_source: Option<PathBuf>,
@@ -190,6 +200,7 @@ impl App {
             .unwrap_or_default();
         let dest_images_template = cfg.paths.images_template.clone();
         let dest_videos_template = cfg.paths.videos_template.clone();
+        let raw_mode_disk = cfg.filters.raw_mode;
         Self {
             cfg,
             cfg_path,
@@ -206,6 +217,8 @@ impl App {
             dest_images_template,
             dest_videos_template,
             dest_field: DestField::ImagesRoot,
+            raw_mode_disk,
+            save_prompt_next: SavePromptNext::Confirm,
             chosen_source: None,
             chosen_label: None,
             detected_profile_name: None,
@@ -554,11 +567,23 @@ impl App {
                 self.screen = Screen::SourceSelect;
             }
             KeyCode::Enter => {
-                self.start_scan();
+                if self.cfg.filters.raw_mode != self.raw_mode_disk {
+                    self.save_prompt_next = SavePromptNext::StartScan;
+                    self.screen = Screen::SaveConfigPrompt;
+                } else {
+                    self.start_scan();
+                }
             }
             KeyCode::Char('e') => {
                 self.dest_field = DestField::ImagesRoot;
                 self.screen = Screen::Destination;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.cfg.filters.raw_mode = match self.cfg.filters.raw_mode {
+                    RawMode::All => RawMode::RawOnly,
+                    RawMode::RawOnly => RawMode::NonRawOnly,
+                    RawMode::NonRawOnly => RawMode::All,
+                };
             }
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -659,6 +684,7 @@ impl App {
         self.status = None;
 
         if changed {
+            self.save_prompt_next = SavePromptNext::Confirm;
             self.screen = Screen::SaveConfigPrompt;
         } else {
             self.screen = Screen::Confirm;
@@ -672,19 +698,36 @@ impl App {
                     Ok(()) => {
                         self.status =
                             Some(format!("saved config to {}", self.cfg_path.display()));
+                        // Update on-disk snapshot so we don't re-prompt.
+                        self.raw_mode_disk = self.cfg.filters.raw_mode;
                     }
                     Err(e) => {
                         self.status = Some(format!("save failed: {e}"));
                     }
                 }
-                self.screen = Screen::Confirm;
+                self.finish_save_prompt();
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                // Skip saving; paths apply for this session only.
-                self.status = Some("using paths for this session only".into());
-                self.screen = Screen::Confirm;
+                // Skip saving; values apply for this session only.
+                self.status = Some("using values for this session only".into());
+                // Treat session-only acceptance as "don't re-prompt this session".
+                self.raw_mode_disk = self.cfg.filters.raw_mode;
+                self.finish_save_prompt();
             }
             _ => {}
+        }
+    }
+
+    fn finish_save_prompt(&mut self) {
+        match self.save_prompt_next {
+            SavePromptNext::Confirm => {
+                self.screen = Screen::Confirm;
+            }
+            SavePromptNext::StartScan => {
+                self.screen = Screen::Confirm;
+                self.save_prompt_next = SavePromptNext::Confirm;
+                self.start_scan();
+            }
         }
     }
 
@@ -952,7 +995,7 @@ impl App {
             Screen::SourceSelect => "↑/↓ pick   Enter select   m manual path   r rescan   q quit",
             Screen::Destination => "Tab/↑↓ field   Enter accept   Esc cancel",
             Screen::SaveConfigPrompt => "y save   n / Enter session-only   Esc cancel",
-            Screen::Confirm => "Enter scan   e edit destinations   Esc back   q quit",
+            Screen::Confirm => "Enter scan   e edit destinations   r raw mode   Esc back   q quit",
             Screen::Scan => "Esc cancel",
             Screen::Review => "↑/↓ scroll   s sync   d dry-run   Esc back   q quit",
             Screen::Sync => "Esc abort",
@@ -1135,47 +1178,58 @@ impl App {
     // ------- Screen: SaveConfigPrompt -------
 
     fn render_save_prompt(&self, f: &mut Frame, area: Rect) {
-        let body = vec![
-            Line::raw(""),
-            Line::from(Span::styled(
+        let (title, intro, body_lines): (&str, &str, Vec<Line>) = match self.save_prompt_next {
+            SavePromptNext::Confirm => (
+                " save destinations? ",
                 "Save these destination paths to your config file?",
-                Style::default().fg(Color::Yellow),
-            )),
+                vec![
+                    Line::from(vec![
+                        Span::styled("  Images:   ", Style::default().fg(Color::Cyan)),
+                        Span::raw(format!(
+                            "{}/{}",
+                            self.dest_images_root.trim(),
+                            self.dest_images_template.trim()
+                        )),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Videos:   ", Style::default().fg(Color::Cyan)),
+                        Span::raw(format!(
+                            "{}/{}",
+                            self.dest_videos_root.trim(),
+                            self.dest_videos_template.trim()
+                        )),
+                    ]),
+                ],
+            ),
+            SavePromptNext::StartScan => (
+                " save raw mode? ",
+                "Save this raw-mode setting to your config file?",
+                vec![Line::from(vec![
+                    Span::styled("  Raw mode: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
+                ])],
+            ),
+        };
+
+        let mut body = vec![
+            Line::raw(""),
+            Line::from(Span::styled(intro, Style::default().fg(Color::Yellow))),
             Line::raw(""),
             Line::from(vec![
                 Span::styled("  Path: ", Style::default().fg(Color::Cyan)),
                 Span::raw(self.cfg_path.display().to_string()),
             ]),
             Line::raw(""),
-            Line::from(vec![
-                Span::styled("  Images:   ", Style::default().fg(Color::Cyan)),
-                Span::raw(format!(
-                    "{}/{}",
-                    self.dest_images_root.trim(),
-                    self.dest_images_template.trim()
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("  Videos:   ", Style::default().fg(Color::Cyan)),
-                Span::raw(format!(
-                    "{}/{}",
-                    self.dest_videos_root.trim(),
-                    self.dest_videos_template.trim()
-                )),
-            ]),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "  [y] save to config        [n] use this session only        [Esc] cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
+        body.extend(body_lines);
+        body.push(Line::raw(""));
+        body.push(Line::from(Span::styled(
+            "  [y] save to config        [n] use this session only        [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
         f.render_widget(
             Paragraph::new(body)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" save destinations? "),
-                )
+                .block(Block::default().borders(Borders::ALL).title(title))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -1220,6 +1274,12 @@ impl App {
             Line::from(vec![
                 Span::styled("Videos → ", Style::default().fg(Color::Cyan)),
                 Span::raw(format!("{videos}/{}", self.cfg.paths.videos_template)),
+            ]),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Raw mode: ", Style::default().fg(Color::Cyan)),
+                Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
+                Span::styled("   (press r to cycle)", Style::default().fg(Color::DarkGray)),
             ]),
             Line::raw(""),
             Line::from(Span::styled(
@@ -1482,6 +1542,14 @@ fn trim_label(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+fn raw_mode_label(m: RawMode) -> &'static str {
+    match m {
+        RawMode::All => "All (RAW + JPEG)",
+        RawMode::RawOnly => "RAW only",
+        RawMode::NonRawOnly => "Non-RAW only",
     }
 }
 
