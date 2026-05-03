@@ -46,21 +46,22 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    let app_cfg = load_app_config()?;
+    let (app_cfg, cfg_path) = load_app_config()?;
     let registry = ProfileRegistry::with_builtins()
         .context("loading built-in camera profiles")?;
 
     let mut terminal = ratatui::try_init().context("initialising terminal")?;
-    let result = App::new(app_cfg, registry).run(&mut terminal).await;
+    let result = App::new(app_cfg, cfg_path, registry).run(&mut terminal).await;
     ratatui::restore();
     result
 }
 
-fn load_app_config() -> Result<AppConfig> {
+fn load_app_config() -> Result<(AppConfig, PathBuf)> {
     let path = AppConfig::default_path()
         .context("could not determine config dir on this platform")?;
-    AppConfig::load_or_default(&path)
-        .with_context(|| format!("loading config from {}", path.display()))
+    let cfg = AppConfig::load_or_default(&path)
+        .with_context(|| format!("loading config from {}", path.display()))?;
+    Ok((cfg, path))
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,8 @@ fn load_app_config() -> Result<AppConfig> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     SourceSelect,
+    Destination,
+    SaveConfigPrompt,
     Confirm,
     Scan,
     Review,
@@ -77,11 +80,40 @@ enum Screen {
     Summary,
 }
 
+/// Which field of the destination editor is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestField {
+    ImagesRoot,
+    VideosRoot,
+    ImagesTemplate,
+    VideosTemplate,
+}
+
+impl DestField {
+    fn next(self) -> Self {
+        match self {
+            DestField::ImagesRoot => DestField::VideosRoot,
+            DestField::VideosRoot => DestField::ImagesTemplate,
+            DestField::ImagesTemplate => DestField::VideosTemplate,
+            DestField::VideosTemplate => DestField::ImagesRoot,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            DestField::ImagesRoot => DestField::VideosTemplate,
+            DestField::VideosRoot => DestField::ImagesRoot,
+            DestField::ImagesTemplate => DestField::VideosRoot,
+            DestField::VideosTemplate => DestField::ImagesTemplate,
+        }
+    }
+}
+
 type ScanResult = Result<(SyncPlan, Arc<dyn MediaSource>), String>;
 type ScanHandle = tokio::task::JoinHandle<ScanResult>;
 
 struct App {
     cfg: AppConfig,
+    cfg_path: PathBuf,
     registry: ProfileRegistry,
 
     screen: Screen,
@@ -93,6 +125,13 @@ struct App {
     sources_state: ListState,
     manual_path: String,
     manual_focused: bool,
+
+    // Destination editor (live buffers; copied to cfg on accept)
+    dest_images_root: String,
+    dest_videos_root: String,
+    dest_images_template: String,
+    dest_videos_template: String,
+    dest_field: DestField,
 
     // After Confirm
     chosen_source: Option<PathBuf>,
@@ -131,14 +170,29 @@ struct App {
 }
 
 impl App {
-    fn new(cfg: AppConfig, registry: ProfileRegistry) -> Self {
+    fn new(cfg: AppConfig, cfg_path: PathBuf, registry: ProfileRegistry) -> Self {
         let mounts = detect_mounts();
         let mut sources_state = ListState::default();
         if !mounts.is_empty() {
             sources_state.select(Some(0));
         }
+        let dest_images_root = cfg
+            .paths
+            .images_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let dest_videos_root = cfg
+            .paths
+            .videos_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let dest_images_template = cfg.paths.images_template.clone();
+        let dest_videos_template = cfg.paths.videos_template.clone();
         Self {
             cfg,
+            cfg_path,
             registry,
             screen: Screen::SourceSelect,
             should_quit: false,
@@ -147,6 +201,11 @@ impl App {
             sources_state,
             manual_path: String::new(),
             manual_focused: false,
+            dest_images_root,
+            dest_videos_root,
+            dest_images_template,
+            dest_videos_template,
+            dest_field: DestField::ImagesRoot,
             chosen_source: None,
             chosen_label: None,
             detected_profile_name: None,
@@ -386,6 +445,8 @@ impl App {
         }
         match self.screen {
             Screen::SourceSelect => self.on_key_source_select(key),
+            Screen::Destination => self.on_key_destination(key),
+            Screen::SaveConfigPrompt => self.on_key_save_prompt(key),
             Screen::Confirm => self.on_key_confirm(key).await,
             Screen::Scan => self.on_key_scan(key),
             Screen::Review => self.on_key_review(key).await,
@@ -471,8 +532,20 @@ impl App {
         self.detected_profile_name = Some(profile.display_name.clone());
         self.chosen_label = Some(label);
         self.chosen_source = Some(path);
-        self.screen = Screen::Confirm;
         self.status = None;
+
+        // If destination roots are missing, force the user to fill them in
+        // before showing the Confirm screen.
+        if self.cfg.paths.images_root.is_none() || self.cfg.paths.videos_root.is_none() {
+            self.dest_field = if self.cfg.paths.images_root.is_none() {
+                DestField::ImagesRoot
+            } else {
+                DestField::VideosRoot
+            };
+            self.screen = Screen::Destination;
+        } else {
+            self.screen = Screen::Confirm;
+        }
     }
 
     async fn on_key_confirm(&mut self, key: KeyEvent) {
@@ -483,8 +556,133 @@ impl App {
             KeyCode::Enter => {
                 self.start_scan();
             }
+            KeyCode::Char('e') => {
+                self.dest_field = DestField::ImagesRoot;
+                self.screen = Screen::Destination;
+            }
             KeyCode::Char('q') => {
                 self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
+    // ------- Destination editor -------
+
+    fn on_key_destination(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                // Back out without applying. If we got here because roots
+                // are missing, return to SourceSelect; otherwise to Confirm.
+                if self.cfg.paths.images_root.is_none()
+                    || self.cfg.paths.videos_root.is_none()
+                {
+                    self.screen = Screen::SourceSelect;
+                } else {
+                    self.screen = Screen::Confirm;
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                self.dest_field = self.dest_field.next();
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.dest_field = self.dest_field.prev();
+            }
+            KeyCode::Enter => {
+                self.try_apply_destination();
+            }
+            KeyCode::Backspace => {
+                self.dest_buffer_mut().pop();
+            }
+            KeyCode::Char(c) => {
+                self.dest_buffer_mut().push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn dest_buffer_mut(&mut self) -> &mut String {
+        match self.dest_field {
+            DestField::ImagesRoot => &mut self.dest_images_root,
+            DestField::VideosRoot => &mut self.dest_videos_root,
+            DestField::ImagesTemplate => &mut self.dest_images_template,
+            DestField::VideosTemplate => &mut self.dest_videos_template,
+        }
+    }
+
+    /// Validate the editor buffers; on success copy them into `self.cfg`
+    /// and either ask whether to save (if changed from the on-disk config)
+    /// or jump straight to Confirm.
+    fn try_apply_destination(&mut self) {
+        let images = self.dest_images_root.trim();
+        let videos = self.dest_videos_root.trim();
+        if images.is_empty() {
+            self.status = Some("images path is empty".into());
+            self.dest_field = DestField::ImagesRoot;
+            return;
+        }
+        if videos.is_empty() {
+            self.status = Some("videos path is empty".into());
+            self.dest_field = DestField::VideosRoot;
+            return;
+        }
+        // Validate templates by parsing.
+        if let Err(e) = imagesync_core::template::PathTemplate::parse(
+            self.dest_images_template.trim(),
+        ) {
+            self.status = Some(format!("images template invalid: {e}"));
+            self.dest_field = DestField::ImagesTemplate;
+            return;
+        }
+        if let Err(e) = imagesync_core::template::PathTemplate::parse(
+            self.dest_videos_template.trim(),
+        ) {
+            self.status = Some(format!("videos template invalid: {e}"));
+            self.dest_field = DestField::VideosTemplate;
+            return;
+        }
+
+        let new_images = PathBuf::from(images);
+        let new_videos = PathBuf::from(videos);
+        let new_img_tmpl = self.dest_images_template.trim().to_string();
+        let new_vid_tmpl = self.dest_videos_template.trim().to_string();
+
+        let changed = self.cfg.paths.images_root.as_ref() != Some(&new_images)
+            || self.cfg.paths.videos_root.as_ref() != Some(&new_videos)
+            || self.cfg.paths.images_template != new_img_tmpl
+            || self.cfg.paths.videos_template != new_vid_tmpl;
+
+        self.cfg.paths.images_root = Some(new_images);
+        self.cfg.paths.videos_root = Some(new_videos);
+        self.cfg.paths.images_template = new_img_tmpl;
+        self.cfg.paths.videos_template = new_vid_tmpl;
+        self.status = None;
+
+        if changed {
+            self.screen = Screen::SaveConfigPrompt;
+        } else {
+            self.screen = Screen::Confirm;
+        }
+    }
+
+    fn on_key_save_prompt(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                match self.cfg.save(&self.cfg_path) {
+                    Ok(()) => {
+                        self.status =
+                            Some(format!("saved config to {}", self.cfg_path.display()));
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("save failed: {e}"));
+                    }
+                }
+                self.screen = Screen::Confirm;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                // Skip saving; paths apply for this session only.
+                self.status = Some("using paths for this session only".into());
+                self.screen = Screen::Confirm;
             }
             _ => {}
         }
@@ -697,6 +895,8 @@ impl App {
         self.render_header(f, rows[0]);
         match self.screen {
             Screen::SourceSelect => self.render_source_select(f, rows[1]),
+            Screen::Destination => self.render_destination(f, rows[1]),
+            Screen::SaveConfigPrompt => self.render_save_prompt(f, rows[1]),
             Screen::Confirm => self.render_confirm(f, rows[1]),
             Screen::Scan => self.render_scan(f, rows[1]),
             Screen::Review => self.render_review(f, rows[1]),
@@ -710,6 +910,8 @@ impl App {
     fn render_header(&self, f: &mut Frame, area: Rect) {
         let title = match self.screen {
             Screen::SourceSelect => "select source",
+            Screen::Destination => "destination paths",
+            Screen::SaveConfigPrompt => "save to config?",
             Screen::Confirm => "confirm",
             Screen::Scan => "scanning",
             Screen::Review => "review plan",
@@ -746,7 +948,9 @@ impl App {
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help = match self.screen {
             Screen::SourceSelect => "↑/↓ pick   Enter select   m manual path   r rescan   q quit",
-            Screen::Confirm => "Enter scan   Esc back   q quit",
+            Screen::Destination => "Tab/↑↓ field   Enter accept   Esc cancel",
+            Screen::SaveConfigPrompt => "y save   n / Enter session-only   Esc cancel",
+            Screen::Confirm => "Enter scan   e edit destinations   Esc back   q quit",
             Screen::Scan => "Esc cancel",
             Screen::Review => "↑/↓ scroll   s sync   d dry-run   Esc back   q quit",
             Screen::Sync => "Esc abort",
@@ -837,6 +1041,142 @@ impl App {
             .style(style)
             .block(Block::default().borders(Borders::ALL).title(title));
         f.render_widget(para, cols[1]);
+    }
+
+    // ------- Screen: Destination -------
+
+    fn render_destination(&self, f: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        self.render_dest_field(
+            f,
+            rows[0],
+            DestField::ImagesRoot,
+            " images root ",
+            &self.dest_images_root,
+        );
+        self.render_dest_field(
+            f,
+            rows[1],
+            DestField::VideosRoot,
+            " videos root ",
+            &self.dest_videos_root,
+        );
+        self.render_dest_field(
+            f,
+            rows[2],
+            DestField::ImagesTemplate,
+            " images template ",
+            &self.dest_images_template,
+        );
+        self.render_dest_field(
+            f,
+            rows[3],
+            DestField::VideosTemplate,
+            " videos template ",
+            &self.dest_videos_template,
+        );
+
+        let hint = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Templates use tokens like {yyyy}, {mm}, {dd}, {month}, {HH}, {MM}, {SS}.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Tab moves between fields. Enter accepts. Esc cancels.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), rows[4]);
+    }
+
+    fn render_dest_field(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        field: DestField,
+        title: &str,
+        value: &str,
+    ) {
+        let focused = self.dest_field == field;
+        let style = if focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let display = if focused {
+            format!("{value}_")
+        } else {
+            value.to_string()
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            });
+        f.render_widget(Paragraph::new(display).style(style).block(block), area);
+    }
+
+    // ------- Screen: SaveConfigPrompt -------
+
+    fn render_save_prompt(&self, f: &mut Frame, area: Rect) {
+        let body = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Save these destination paths to your config file?",
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  Path: ", Style::default().fg(Color::Cyan)),
+                Span::raw(self.cfg_path.display().to_string()),
+            ]),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  Images:   ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(
+                    "{}/{}",
+                    self.dest_images_root.trim(),
+                    self.dest_images_template.trim()
+                )),
+            ]),
+            Line::from(vec![
+                Span::styled("  Videos:   ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(
+                    "{}/{}",
+                    self.dest_videos_root.trim(),
+                    self.dest_videos_template.trim()
+                )),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  [y] save to config        [n] use this session only        [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" save destinations? "),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     // ------- Screen: Confirm -------
