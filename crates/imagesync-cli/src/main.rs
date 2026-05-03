@@ -38,6 +38,8 @@ enum Command {
     Sync(SyncArgs),
     /// List loaded camera profiles.
     Profiles,
+    /// List detected mountable sources (SD cards, removable drives).
+    Sources,
     /// Print the resolved config (after applying any flags) and exit.
     Config,
 }
@@ -132,6 +134,7 @@ async fn main() -> Result<()> {
             run_scan_or_sync(&cli, args.common, false, args.dry_run).await
         }
         Command::Profiles => run_profiles(),
+        Command::Sources => run_sources(),
         Command::Config => run_config(&cli),
     }
 }
@@ -381,6 +384,24 @@ fn run_profiles() -> Result<()> {
             p.image_extensions.join(","),
             p.video_extensions.join(",")
         );
+    }
+    Ok(())
+}
+
+fn run_sources() -> Result<()> {
+    let mounts = imagesync_core::mount::detect_mounts();
+    if mounts.is_empty() {
+        println!("No mounted sources detected.");
+        return Ok(());
+    }
+    println!("Detected sources:");
+    for m in mounts {
+        let tag = match m.rank {
+            imagesync_core::mount::MountRank::CameraCard => "[CAMERA]",
+            imagesync_core::mount::MountRank::Removable => "[remov.]",
+            imagesync_core::mount::MountRank::Other => "[other ]",
+        };
+        println!("  {tag} {:<24} {}", m.label, m.path.display());
     }
     Ok(())
 }

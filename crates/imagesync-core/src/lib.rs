@@ -12,6 +12,7 @@ pub mod error;
 pub mod events;
 pub mod exiftool;
 pub mod metadata;
+pub mod mount;
 pub mod plan;
 pub mod profiles;
 pub mod source;
