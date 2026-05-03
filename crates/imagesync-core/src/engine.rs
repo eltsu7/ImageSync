@@ -340,7 +340,7 @@ async fn do_copy(
     let bytes_total = item.source_size;
     let rel = item.source_rel_path.clone();
     let tx2 = tx.clone();
-    let result = crate::copy::copy_atomic(&src_path, &dest, bytes_total, &cfg.verify, |done, total| {
+    let result = crate::copy::copy_atomic(&src_path, &dest, bytes_total, &cfg.verify, move |done, total| {
         // Best-effort progress; ignore send errors.
         let _ = tx2.try_send(EngineEvent::CopyProgress {
             rel_path: rel.clone(),
