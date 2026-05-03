@@ -11,7 +11,8 @@
 //! interleave rendering and engine progress without spawning a separate
 //! input thread.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use imagesync_core::config::{AppConfig, RawMode};
 use imagesync_core::engine::ExecuteOptions;
-use imagesync_core::events::{CopyOutcome, EngineEvent, PlannedAction};
+use imagesync_core::events::{CopyOutcome, EngineEvent, MediaKindWire, PlannedAction, PlannedFile};
 use imagesync_core::mount::{detect_mounts, DetectedMount, MountRank};
 use imagesync_core::plan::SyncPlan;
 use imagesync_core::source::{FilesystemSource, MediaSource};
@@ -742,7 +743,11 @@ impl App {
     }
 
     async fn on_key_review(&mut self, key: KeyEvent) {
-        let n = self.plan.as_ref().map(|p| p.items.len()).unwrap_or(0);
+        let n = self
+            .plan
+            .as_ref()
+            .map(|p| build_review_tree(p).len())
+            .unwrap_or(0);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.plan = None;
@@ -1375,36 +1380,13 @@ impl App {
             rows[0],
         );
 
-        let items: Vec<ListItem> = plan
-            .items
-            .iter()
-            .map(|it| {
-                let (label, color) = match it.action {
-                    PlannedAction::Copy => ("COPY ", Color::Green),
-                    PlannedAction::SkipExists => ("SKIP ", Color::DarkGray),
-                    PlannedAction::SkipFiltered => ("FILT ", Color::DarkGray),
-                    PlannedAction::SkipNoDate => ("NDAT ", Color::Yellow),
-                    PlannedAction::Error => ("ERR  ", Color::Red),
-                };
-                let dest = it
-                    .dest_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "-".into());
-                ListItem::new(Line::from(vec![
-                    Span::styled(label, Style::default().fg(color).bold()),
-                    Span::raw(format!("{:<32}", trim_label(&it.source_rel_path, 32))),
-                    Span::raw(" → "),
-                    Span::styled(dest, Style::default().fg(Color::DarkGray)),
-                ]))
-            })
-            .collect();
+        let items = build_review_tree(plan);
 
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!(" items ({}) ", plan.items.len())),
+                    .title(format!(" preview ({} new files) ", plan.copies())),
             )
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
         f.render_stateful_widget(list, rows[1], &mut self.review_state);
@@ -1551,6 +1533,153 @@ fn raw_mode_label(m: RawMode) -> &'static str {
         RawMode::RawOnly => "RAW only",
         RawMode::NonRawOnly => "Non-RAW only",
     }
+}
+
+/// Build the grouped tree view of files that would be copied: one section
+/// per destination directory, with raw/non-raw/video counts and at most
+/// 3 sample filenames per directory. Directories that don't exist on disk
+/// are marked with a leading `+`.
+fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
+    // Group COPY items by parent directory.
+    let mut groups: BTreeMap<PathBuf, Vec<&PlannedFile>> = BTreeMap::new();
+    for it in &plan.items {
+        if it.action != PlannedAction::Copy {
+            continue;
+        }
+        let Some(dest) = it.dest_path.as_ref() else {
+            continue;
+        };
+        let parent = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        groups.entry(parent).or_default().push(it);
+    }
+
+    let mut out: Vec<ListItem<'static>> = Vec::new();
+
+    if groups.is_empty() {
+        out.push(ListItem::new(Line::from(Span::styled(
+            "(no new files to copy)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+        return out;
+    }
+
+    for (dir, files) in &groups {
+        let mut raw = 0u32;
+        let mut img = 0u32;
+        let mut vid = 0u32;
+        let mut other = 0u32;
+        for f in files {
+            match f.kind {
+                MediaKindWire::RawImage => raw += 1,
+                MediaKindWire::Image => img += 1,
+                MediaKindWire::Video => vid += 1,
+                MediaKindWire::Sidecar => other += 1,
+            }
+        }
+
+        let is_new = !dir.exists();
+        let marker = if is_new { "+ " } else { "  " };
+        let marker_style = if is_new {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let dir_style = if is_new {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::Cyan).bold()
+        };
+
+        // Header: "+ /path/to/dir/   RAW: 12  IMG: 8  VID: 1"
+        let mut spans = vec![
+            Span::styled(marker, marker_style),
+            Span::styled(format!("{}/", dir.display()), dir_style),
+            Span::raw("   "),
+        ];
+        if raw > 0 {
+            spans.push(Span::styled(
+                format!("RAW: {raw}  "),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        if img > 0 {
+            spans.push(Span::styled(
+                format!("IMG: {img}  "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if vid > 0 {
+            spans.push(Span::styled(
+                format!("VID: {vid}  "),
+                Style::default().fg(Color::Blue),
+            ));
+        }
+        if other > 0 {
+            spans.push(Span::styled(
+                format!("SIDE: {other}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        out.push(ListItem::new(Line::from(spans)));
+
+        // Sample filenames (top 3 by destination filename, alphabetical).
+        let mut sorted = files.clone();
+        sorted.sort_by(|a, b| {
+            let an = a
+                .dest_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let bn = b
+                .dest_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            an.cmp(&bn)
+        });
+        let total = sorted.len();
+        let show = total.min(3);
+        for f in &sorted[..show] {
+            let name = f
+                .dest_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "?".into());
+            let kind_tag = match f.kind {
+                MediaKindWire::RawImage => Span::styled("RAW", Style::default().fg(Color::Magenta)),
+                MediaKindWire::Image => Span::styled("IMG", Style::default().fg(Color::Yellow)),
+                MediaKindWire::Video => Span::styled("VID", Style::default().fg(Color::Blue)),
+                MediaKindWire::Sidecar => {
+                    Span::styled("SIDE", Style::default().fg(Color::DarkGray))
+                }
+            };
+            out.push(ListItem::new(Line::from(vec![
+                Span::raw("    ├─ "),
+                kind_tag,
+                Span::raw("  "),
+                Span::raw(name),
+            ])));
+        }
+        if total > show {
+            out.push(ListItem::new(Line::from(vec![
+                Span::raw("    └─ "),
+                Span::styled(
+                    format!("(... {} more)", total - show),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])));
+        }
+        // Blank spacer between groups.
+        out.push(ListItem::new(Line::raw("")));
+    }
+
+    out
 }
 
 fn human_bytes(b: u64) -> String {
