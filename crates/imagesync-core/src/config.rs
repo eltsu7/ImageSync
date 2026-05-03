@@ -84,7 +84,7 @@ impl Default for PerformanceConfig {
         Self {
             scan_workers: 0,
             metadata_batch_size: 50,
-            copy_workers: 2,
+            copy_workers: 1,
         }
     }
 }
