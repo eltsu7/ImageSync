@@ -109,19 +109,22 @@ pub fn build_plan(
         media_index.insert(key, m);
     }
 
+    // Cache of destination directory listings for case-insensitive dedupe.
+    let mut dir_cache = DirCache::default();
+
     let mut items: Vec<PlannedFile> = Vec::with_capacity(media.len() + sidecars.len());
 
     for m in &media {
-        items.push(plan_one_media(cfg, m)?);
+        items.push(plan_one_media(cfg, m, &mut dir_cache)?);
     }
 
     for s in sidecars {
         let key = stem_key(&s.file.rel_path);
         if let Some(parent) = media_index.get(&key).copied() {
-            items.push(plan_sidecar_with_parent(cfg, &s, parent)?);
+            items.push(plan_sidecar_with_parent(cfg, &s, parent, &mut dir_cache)?);
         } else {
             // Orphan sidecar — plan it standalone if we have any date.
-            items.push(plan_one_media(cfg, &s)?);
+            items.push(plan_one_media(cfg, &s, &mut dir_cache)?);
         }
     }
 
@@ -145,7 +148,11 @@ fn file_name_of(rel_path: &str) -> &str {
     rel_path.rsplit('/').next().unwrap_or(rel_path)
 }
 
-fn plan_one_media(cfg: &EngineConfig, s: &ScannedFile) -> Result<PlannedFile> {
+fn plan_one_media(
+    cfg: &EngineConfig,
+    s: &ScannedFile,
+    dir_cache: &mut DirCache,
+) -> Result<PlannedFile> {
     // Apply user filters.
     if !classify::should_include(
         s.kind,
@@ -182,12 +189,7 @@ fn plan_one_media(cfg: &EngineConfig, s: &ScannedFile) -> Result<PlannedFile> {
 
     let name = file_name_of(&s.file.rel_path);
     let dest = dest_path_for(cfg, s.kind, &meta.datetime, name)?;
-    let action = decide_action(&dest, s.file.size);
-    let reason = match action {
-        PlannedAction::SkipExists => Some("destination exists with same size".into()),
-        PlannedAction::Error => Some("destination exists with different size".into()),
-        _ => None,
-    };
+    let (action, reason) = decide_action_with_reason(&dest, name, s.file.size, dir_cache);
 
     Ok(PlannedFile {
         source: s.source.clone(),
@@ -206,6 +208,7 @@ fn plan_sidecar_with_parent(
     cfg: &EngineConfig,
     s: &ScannedFile,
     parent: &ScannedFile,
+    dir_cache: &mut DirCache,
 ) -> Result<PlannedFile> {
     if !cfg.filters.include_sidecars {
         return Ok(PlannedFile {
@@ -238,12 +241,7 @@ fn plan_sidecar_with_parent(
 
     let name = file_name_of(&s.file.rel_path);
     let dest = dest_path_for(cfg, parent.kind, &parent_meta.datetime, name)?;
-    let action = decide_action(&dest, s.file.size);
-    let reason = match action {
-        PlannedAction::SkipExists => Some("destination exists with same size".into()),
-        PlannedAction::Error => Some("destination exists with different size".into()),
-        _ => None,
-    };
+    let (action, reason) = decide_action_with_reason(&dest, name, s.file.size, dir_cache);
 
     Ok(PlannedFile {
         source: s.source.clone(),
@@ -258,17 +256,102 @@ fn plan_sidecar_with_parent(
     })
 }
 
-fn decide_action(dest: &Path, source_size: u64) -> PlannedAction {
-    match std::fs::metadata(dest) {
-        Ok(m) if m.is_file() => {
-            if m.len() == source_size {
-                PlannedAction::SkipExists
+/// Cache of destination directory listings keyed by directory path. Each
+/// entry maps a lowercase basename to the actual on-disk filename and its
+/// size. Lets us check existence case-insensitively with one `read_dir` per
+/// directory instead of per file.
+#[derive(Debug, Default)]
+struct DirCache {
+    cache: HashMap<PathBuf, Option<HashMap<String, DirEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DirEntry {
+    /// Actual on-disk filename (preserves case).
+    actual_name: String,
+    size: u64,
+    is_file: bool,
+}
+
+impl DirCache {
+    fn lookup(&mut self, dir: &Path, basename: &str) -> Option<DirEntry> {
+        let entries = self
+            .cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_dir_lowercase(dir));
+        let key = basename.to_lowercase();
+        entries.as_ref().and_then(|m| m.get(&key).cloned())
+    }
+}
+
+fn read_dir_lowercase(dir: &Path) -> Option<HashMap<String, DirEntry>> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut out = HashMap::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let key = name.to_lowercase();
+        let (size, is_file) = match entry.metadata() {
+            Ok(m) => (m.len(), m.is_file()),
+            Err(_) => (0, false),
+        };
+        out.insert(
+            key,
+            DirEntry {
+                actual_name: name,
+                size,
+                is_file,
+            },
+        );
+    }
+    Some(out)
+}
+
+/// Decide what to do with a planned destination, using case-insensitive
+/// lookup. If a file with the same basename (in any case) exists at the
+/// destination directory, we treat it as the existing target. Returns the
+/// action plus an optional human-readable reason (especially useful when the
+/// existing file has different case than the source).
+fn decide_action_with_reason(
+    dest: &Path,
+    source_name: &str,
+    source_size: u64,
+    dir_cache: &mut DirCache,
+) -> (PlannedAction, Option<String>) {
+    let Some(parent) = dest.parent() else {
+        return (PlannedAction::Copy, None);
+    };
+    match dir_cache.lookup(parent, source_name) {
+        None => (PlannedAction::Copy, None),
+        Some(entry) if !entry.is_file => (
+            PlannedAction::Error,
+            Some(format!(
+                "destination path exists but is not a regular file: {}",
+                entry.actual_name
+            )),
+        ),
+        Some(entry) if entry.size == source_size => {
+            if entry.actual_name == source_name {
+                (
+                    PlannedAction::SkipExists,
+                    Some("destination exists with same size".into()),
+                )
             } else {
-                PlannedAction::Error
+                (
+                    PlannedAction::SkipExists,
+                    Some(format!(
+                        "destination exists with same size (different case: {})",
+                        entry.actual_name
+                    )),
+                )
             }
         }
-        Ok(_) => PlannedAction::Error, // dest exists but isn't a file
-        Err(_) => PlannedAction::Copy,
+        Some(entry) => (
+            PlannedAction::Error,
+            Some(format!(
+                "destination exists ({}) with different size: {} vs source {}",
+                entry.actual_name, entry.size, source_size
+            )),
+        ),
     }
 }
 
@@ -329,5 +412,61 @@ mod tests {
             true,
             true
         ));
+    }
+
+    fn write_file(path: &Path, size: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; size]).unwrap();
+    }
+
+    #[test]
+    fn dedupe_no_existing_returns_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("DSC04290.ARW");
+        let mut cache = DirCache::default();
+        let (action, _) = decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        assert_eq!(action, PlannedAction::Copy);
+    }
+
+    #[test]
+    fn dedupe_same_case_same_size_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("DSC04290.ARW");
+        write_file(&dest, 100);
+        let mut cache = DirCache::default();
+        let (action, reason) =
+            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        assert_eq!(action, PlannedAction::SkipExists);
+        assert!(reason.unwrap().contains("same size"));
+    }
+
+    #[test]
+    fn dedupe_different_case_same_size_skips() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On disk: lowercase. Source: uppercase.
+        let on_disk = tmp.path().join("dsc04290.arw");
+        write_file(&on_disk, 100);
+        let dest = tmp.path().join("DSC04290.ARW");
+        let mut cache = DirCache::default();
+        let (action, reason) =
+            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        assert_eq!(action, PlannedAction::SkipExists);
+        let r = reason.unwrap();
+        assert!(r.contains("different case"), "reason was: {}", r);
+        assert!(r.contains("dsc04290.arw"), "reason was: {}", r);
+    }
+
+    #[test]
+    fn dedupe_different_case_different_size_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = tmp.path().join("dsc04290.arw");
+        write_file(&on_disk, 50);
+        let dest = tmp.path().join("DSC04290.ARW");
+        let mut cache = DirCache::default();
+        let (action, reason) =
+            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        assert_eq!(action, PlannedAction::Error);
+        let r = reason.unwrap();
+        assert!(r.contains("different size"), "reason was: {}", r);
     }
 }
