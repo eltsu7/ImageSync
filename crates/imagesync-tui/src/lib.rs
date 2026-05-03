@@ -178,6 +178,7 @@ struct App {
     summary_copied: u64,
     summary_skipped: u64,
     summary_failed: u64,
+    summary_cancelled: bool,
 }
 
 impl App {
@@ -245,6 +246,7 @@ impl App {
             summary_copied: 0,
             summary_skipped: 0,
             summary_failed: 0,
+            summary_cancelled: false,
         }
     }
 
@@ -788,6 +790,12 @@ impl App {
                 h.abort();
             }
             self.sync_rx = None;
+            // The engine never gets to send SyncSummary on abort, so seed
+            // the summary from the live counters we've been maintaining.
+            self.summary_copied = self.sync_done_copy;
+            self.summary_skipped = self.sync_skipped;
+            self.summary_failed = self.sync_failed;
+            self.summary_cancelled = true;
             self.screen = Screen::Summary;
         }
     }
@@ -826,6 +834,7 @@ impl App {
         self.summary_copied = 0;
         self.summary_skipped = 0;
         self.summary_failed = 0;
+        self.summary_cancelled = false;
         self.dry_run = false;
         self.status = None;
         self.mounts = detect_mounts();
@@ -901,6 +910,7 @@ impl App {
         self.summary_copied = 0;
         self.summary_skipped = 0;
         self.summary_failed = 0;
+        self.summary_cancelled = false;
         self.screen = Screen::Sync;
 
         let engine_cfg = match EngineConfig::try_from_app(&self.cfg) {
@@ -1471,15 +1481,18 @@ impl App {
     // ------- Screen: Summary -------
 
     fn render_summary(&self, f: &mut Frame, area: Rect) {
+        let (heading, heading_color) = if self.summary_cancelled {
+            ("Sync cancelled — partial results below.", Color::Yellow)
+        } else if self.dry_run {
+            ("Dry run complete. No files were written.", Color::Green)
+        } else {
+            ("Sync complete.", Color::Green)
+        };
         let body = vec![
             Line::raw(""),
             Line::from(Span::styled(
-                if self.dry_run {
-                    "Dry run complete. No files were written."
-                } else {
-                    "Sync complete."
-                },
-                Style::default().fg(Color::Green).bold(),
+                heading,
+                Style::default().fg(heading_color).bold(),
             )),
             Line::raw(""),
             Line::from(vec![
