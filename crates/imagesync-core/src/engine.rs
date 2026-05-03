@@ -13,7 +13,7 @@ use crate::events::{CopyOutcome, EngineEvent, PlannedAction, PlannedFile};
 use crate::exiftool::ExifTool;
 use crate::metadata;
 use crate::plan::{self, ScannedFile, SyncPlan};
-use crate::profiles::{CameraProfile, ProfileRegistry};
+use crate::profiles::ProfileRegistry;
 use crate::source::{BackendHandle, MediaSource};
 
 /// Options for [`Engine::execute`].
@@ -40,141 +40,36 @@ impl Engine {
         &self.registry
     }
 
-    /// Run scan → plan in one pass against a single source. Emits events to
-    /// the returned stream and resolves to the resulting [`SyncPlan`] via
-    /// [`Engine::collect_plan`] or by listening for [`EngineEvent::PlanReady`]
-    /// and then calling [`Engine::plan`] separately.
-    ///
-    /// For v0.1 we offer a unified helper, [`Engine::scan_and_plan`], that
-    /// returns both the plan and the event stream — simpler for the CLI.
-    pub async fn scan_and_plan(
+    /// Spawn a scan + plan task. Returns a join handle that resolves to the
+    /// final [`SyncPlan`] together with a stream of progress events. The
+    /// caller MUST consume the stream concurrently with awaiting the join
+    /// handle, otherwise the channel buffer fills up and progress events
+    /// look like a single end-of-run flush.
+    pub fn scan_and_plan(
         &self,
         source: Arc<dyn MediaSource>,
-    ) -> Result<(SyncPlan, ReceiverStream<EngineEvent>)> {
+    ) -> (
+        tokio::task::JoinHandle<Result<SyncPlan>>,
+        ReceiverStream<EngineEvent>,
+    ) {
         let (tx, rx) = mpsc::channel::<EngineEvent>(256);
-        let plan = self
-            .scan_and_plan_inner(source, tx.clone())
-            .await
-            .map_err(|e| {
-                let _ = tx.try_send(EngineEvent::Error {
-                    message: format!("{e}"),
-                    rel_path: None,
-                });
-                e
-            })?;
-        Ok((plan, ReceiverStream::new(rx)))
-    }
-
-    async fn scan_and_plan_inner(
-        &self,
-        source: Arc<dyn MediaSource>,
-        tx: mpsc::Sender<EngineEvent>,
-    ) -> Result<SyncPlan> {
-        let _ = tx
-            .send(EngineEvent::ScanStarted {
-                source: source.id().clone(),
-                display_name: source.display_name().to_string(),
-            })
-            .await;
-
-        // Detect profile.
-        let profile = self.detect_profile(source.as_ref());
-
-        // Enumerate files.
-        let files = source.list_files().await?;
-        let _ = tx
-            .send(EngineEvent::ScanComplete {
-                source: source.id().clone(),
-                files: files.len() as u64,
-            })
-            .await;
-
-        // Classify and split into "needs metadata" vs "skip".
-        let mut to_meta: Vec<crate::source::SourceFile> = Vec::new();
-        let mut kinds: Vec<classify::MediaKind> = Vec::new();
-        for f in files {
-            let Some(kind) = classify::classify(profile, &f.extension) else {
-                continue; // unknown extension; ignore silently
-            };
-            to_meta.push(f);
-            kinds.push(kind);
-        }
-        tracing::debug!(
-            profile = profile.id,
-            count = to_meta.len(),
-            "classified files for metadata read"
-        );
-
-        // Resolve filesystem paths for each.
-        let mut paths: Vec<PathBuf> = Vec::with_capacity(to_meta.len());
-        for f in &to_meta {
-            paths.push(source.full_path(f).await?);
-        }
-
-        // Read metadata in batches via a stay_open exiftool process.
-        let exif = ExifTool::spawn().await?;
-        let batch_size = self.config.performance.metadata_batch_size.max(1);
-        let mut metas: Vec<Option<metadata::ResolvedMetadata>> = Vec::with_capacity(to_meta.len());
-        let total = to_meta.len() as u64;
-        for chunk in paths.chunks(batch_size) {
-            let raw = exif.read_batch(chunk).await?;
-            // Pair with corresponding source files.
-            let start = metas.len();
-            for (i, m) in raw.iter().enumerate() {
-                let sf = &to_meta[start + i];
-                metas.push(metadata::resolve_one(sf, m));
+        let cfg = self.config.clone();
+        let registry = self.registry.clone();
+        let tx2 = tx.clone();
+        let handle = tokio::spawn(async move {
+            let res = run_scan_and_plan(cfg, registry, source, tx2.clone()).await;
+            if let Err(e) = &res {
+                let _ = tx2
+                    .send(EngineEvent::Error {
+                        message: format!("{e}"),
+                        rel_path: None,
+                    })
+                    .await;
             }
-            let _ = tx
-                .send(EngineEvent::MetadataProgress {
-                    done: metas.len() as u64,
-                    total,
-                })
-                .await;
-        }
-        // Don't fail the run on shutdown errors.
-        let _ = exif.shutdown().await;
-
-        // Build ScannedFile list.
-        let mut scanned: Vec<ScannedFile> = Vec::with_capacity(to_meta.len());
-        for ((f, k), m) in to_meta.into_iter().zip(kinds).zip(metas) {
-            scanned.push(ScannedFile {
-                source: source.id().clone(),
-                file: f,
-                kind: k,
-                metadata: m,
-            });
-        }
-
-        // Emit warnings for fallback dates.
-        for s in &scanned {
-            if let Some(meta) = &s.metadata {
-                if meta.source.is_fallback() {
-                    let _ = tx
-                        .send(EngineEvent::Warning {
-                            message: format!(
-                                "{}: using {} (no DateTimeOriginal)",
-                                s.file.rel_path,
-                                meta.source.label()
-                            ),
-                            rel_path: Some(s.file.rel_path.clone()),
-                        })
-                        .await;
-                }
-            }
-        }
-
-        // Build plan.
-        let plan = plan::build_plan(&self.config, profile, scanned)?;
-
-        let _ = tx
-            .send(EngineEvent::PlanReady {
-                copies: plan.copies(),
-                skips: plan.skips(),
-                errors: plan.errors(),
-            })
-            .await;
-
-        Ok(plan)
+            res
+        });
+        drop(tx);
+        (handle, ReceiverStream::new(rx))
     }
 
     /// Execute a plan, emitting events and returning a summary at the end.
@@ -192,10 +87,119 @@ impl Engine {
         ReceiverStream::new(rx)
     }
 
-    fn detect_profile(&self, source: &dyn MediaSource) -> &CameraProfile {
-        // Override via config.profiles.default could go here in the future.
-        self.registry.detect_for_source(source.root_path())
+}
+
+/// Free-function body of [`Engine::scan_and_plan`]. Lives outside the impl
+/// so it can be moved into a `tokio::spawn`d task without lifetime issues.
+async fn run_scan_and_plan(
+    cfg: EngineConfig,
+    registry: ProfileRegistry,
+    source: Arc<dyn MediaSource>,
+    tx: mpsc::Sender<EngineEvent>,
+) -> Result<SyncPlan> {
+    let _ = tx
+        .send(EngineEvent::ScanStarted {
+            source: source.id().clone(),
+            display_name: source.display_name().to_string(),
+        })
+        .await;
+
+    // Detect profile.
+    let profile = registry.detect_for_source(source.root_path());
+
+    // Enumerate files.
+    let files = source.list_files().await?;
+    let _ = tx
+        .send(EngineEvent::ScanComplete {
+            source: source.id().clone(),
+            files: files.len() as u64,
+        })
+        .await;
+
+    // Classify and split into "needs metadata" vs "skip".
+    let mut to_meta: Vec<crate::source::SourceFile> = Vec::new();
+    let mut kinds: Vec<classify::MediaKind> = Vec::new();
+    for f in files {
+        let Some(kind) = classify::classify(profile, &f.extension) else {
+            continue; // unknown extension; ignore silently
+        };
+        to_meta.push(f);
+        kinds.push(kind);
     }
+    tracing::debug!(
+        profile = profile.id,
+        count = to_meta.len(),
+        "classified files for metadata read"
+    );
+
+    // Resolve filesystem paths for each.
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(to_meta.len());
+    for f in &to_meta {
+        paths.push(source.full_path(f).await?);
+    }
+
+    // Read metadata in batches via a stay_open exiftool process.
+    let exif = ExifTool::spawn().await?;
+    let batch_size = cfg.performance.metadata_batch_size.max(1);
+    let mut metas: Vec<Option<metadata::ResolvedMetadata>> = Vec::with_capacity(to_meta.len());
+    let total = to_meta.len() as u64;
+    for chunk in paths.chunks(batch_size) {
+        let raw = exif.read_batch(chunk).await?;
+        let start = metas.len();
+        for (i, m) in raw.iter().enumerate() {
+            let sf = &to_meta[start + i];
+            metas.push(metadata::resolve_one(sf, m));
+        }
+        let _ = tx
+            .send(EngineEvent::MetadataProgress {
+                done: metas.len() as u64,
+                total,
+            })
+            .await;
+    }
+    let _ = exif.shutdown().await;
+
+    // Build ScannedFile list.
+    let mut scanned: Vec<ScannedFile> = Vec::with_capacity(to_meta.len());
+    for ((f, k), m) in to_meta.into_iter().zip(kinds).zip(metas) {
+        scanned.push(ScannedFile {
+            source: source.id().clone(),
+            file: f,
+            kind: k,
+            metadata: m,
+        });
+    }
+
+    // Emit warnings for fallback dates.
+    for s in &scanned {
+        if let Some(meta) = &s.metadata {
+            if meta.source.is_fallback() {
+                let _ = tx
+                    .send(EngineEvent::Warning {
+                        message: format!(
+                            "{}: using {} (no DateTimeOriginal)",
+                            s.file.rel_path,
+                            meta.source.label()
+                        ),
+                        rel_path: Some(s.file.rel_path.clone()),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    // Build plan.
+    let plan = plan::build_plan(&cfg, profile, scanned)?;
+
+    let _ = tx
+        .send(EngineEvent::PlanReady {
+            copies: plan.copies(),
+            skips: plan.skips(),
+            errors: plan.errors(),
+        })
+        .await;
+
+    Ok(plan)
 }
 
 async fn run_execute(

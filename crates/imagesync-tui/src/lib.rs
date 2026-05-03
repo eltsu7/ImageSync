@@ -822,15 +822,17 @@ impl App {
 
         let handle = tokio::spawn(async move {
             let engine = Engine::new(engine_cfg, registry);
-            let res = engine.scan_and_plan(source.clone()).await;
-            match res {
-                Ok((plan, mut events)) => {
-                    while let Some(ev) = events.next().await {
-                        let _ = tx.send(ev);
-                    }
-                    Ok((plan, source))
-                }
-                Err(e) => Err(format!("{e}")),
+            let (plan_handle, mut events) = engine.scan_and_plan(source.clone());
+            // Forward live events as the engine emits them.
+            while let Some(ev) = events.next().await {
+                let _ = tx.send(ev);
+            }
+            // Stream is closed when the engine task drops the sender, i.e.
+            // when the work has finished. Then collect the plan.
+            match plan_handle.await {
+                Ok(Ok(plan)) => Ok((plan, source)),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(e) => Err(format!("scan task: {e}")),
             }
         });
         self.scan_handle = Some(handle);

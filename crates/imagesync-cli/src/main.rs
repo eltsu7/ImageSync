@@ -238,9 +238,11 @@ async fn run_scan_or_sync(
     .into_arc();
 
     let engine = Engine::new(engine_cfg, registry);
-    let (plan, events) = engine.scan_and_plan(source.clone()).await?;
+    let (plan_handle, events) = engine.scan_and_plan(source.clone());
 
+    // Consume events live; the plan handle finishes when the work does.
     drain_to_stderr(events).await;
+    let plan = plan_handle.await.map_err(|e| anyhow::anyhow!("scan task: {e}"))??;
 
     println!();
     println!("=== Plan ===");
