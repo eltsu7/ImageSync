@@ -1,0 +1,23 @@
+id = "dcim-generic"
+display_name = "Generic DCIM (fallback)"
+
+image_extensions = [
+    "JPG", "JPEG", "PNG", "HEIF", "HEIC", "HIF", "TIF", "TIFF", "WEBP",
+]
+raw_extensions = [
+    "ARW", "CR2", "CR3", "NEF", "NRW", "RAF", "ORF", "RW2", "DNG", "PEF",
+    "SRW", "GPR", "3FR",
+]
+video_extensions = [
+    "MP4", "MOV", "M4V", "MTS", "M2TS", "AVI", "MKV", "INSV", "360",
+]
+sidecar_extensions = ["XMP", "PP3", "DOP"]
+
+# Empty: scan everything under the source root.
+dcim_subdirs = []
+
+[match]
+# No markers — used only as fallback after specific profiles fail to match.
+exif_make = []
+exif_model_glob = []
+marker_paths = []

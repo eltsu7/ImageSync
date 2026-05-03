@@ -1,0 +1,22 @@
+id = "sony-a7m4"
+display_name = "Sony α7 IV (and similar)"
+
+image_extensions   = ["JPG", "JPEG", "HEIF", "HIF"]
+raw_extensions     = ["ARW"]
+video_extensions   = ["MP4", "MTS", "M2TS"]
+sidecar_extensions = ["XMP"]
+
+dcim_subdirs = [
+    "DCIM",
+    "PRIVATE/M4ROOT/CLIP",
+    "AVCHD/BDMV/STREAM",
+]
+
+[match]
+exif_make = ["SONY"]
+exif_model_glob = ["ILCE-7M*", "ILCE-7R*", "ILCE-9*", "ILCE-6*", "ZV-E*"]
+marker_paths = [
+    "PRIVATE/SONY/SONYCARD.IND",
+    "PRIVATE/M4ROOT",
+    "AVF_INFO",
+]
