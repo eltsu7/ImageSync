@@ -15,3 +15,6 @@ Thumbs.db
 # Local env
 .env
 *.log
+
+# Local benchmark config (contains user-specific paths)
+bench.config.toml
