@@ -306,6 +306,75 @@ fn read_dir_lowercase(dir: &Path) -> Option<HashMap<String, DirEntry>> {
     Some(out)
 }
 
+/// Recursive index of one or more destination roots, keyed by
+/// `(lowercase basename, size)`. Lets the engine pre-skip already-imported
+/// files without needing to read their EXIF datetime first.
+///
+/// Two files with the same basename+size are extremely unlikely to be
+/// different content in practice (basenames from cameras are dense
+/// monotonic counters and size collisions on raw/jpeg files are rare).
+/// This is the same key the per-directory `DirCache` dedupe uses, just
+/// applied across the whole library so the check doesn't depend on the
+/// computed destination subfolder.
+#[derive(Debug, Default)]
+pub struct DestIndex {
+    by_name_size: HashMap<(String, u64), PathBuf>,
+}
+
+impl DestIndex {
+    /// Build an index by recursively walking each root that exists. Roots
+    /// that don't exist or can't be read are silently skipped (treated as
+    /// empty).
+    pub fn build(roots: &[&Path]) -> Self {
+        let mut by_name_size: HashMap<(String, u64), PathBuf> = HashMap::new();
+        for root in roots {
+            if !root.exists() {
+                continue;
+            }
+            walk_into(root, &mut by_name_size);
+        }
+        DestIndex { by_name_size }
+    }
+
+    /// Number of distinct files indexed. Mostly for logging/tests.
+    pub fn len(&self) -> usize {
+        self.by_name_size.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name_size.is_empty()
+    }
+
+    /// Look up by case-insensitive basename + exact size. Returns the
+    /// actual on-disk path of the matching file if any.
+    pub fn lookup(&self, basename: &str, size: u64) -> Option<&Path> {
+        let key = (basename.to_lowercase(), size);
+        self.by_name_size.get(&key).map(|p| p.as_path())
+    }
+}
+
+fn walk_into(dir: &Path, out: &mut HashMap<(String, u64), PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            walk_into(&path, out);
+        } else if ft.is_file() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let key = (name, meta.len());
+            // First-write-wins: if the same (name, size) appears in
+            // multiple folders, keep the first one we saw. The match is
+            // only used to report "exists somewhere"; either path is a
+            // valid answer.
+            out.entry(key).or_insert(path);
+        }
+    }
+}
+
 /// Decide what to do with a planned destination, using case-insensitive
 /// lookup. If a file with the same basename (in any case) exists at the
 /// destination directory, we treat it as the existing target. Returns the
@@ -468,5 +537,60 @@ mod tests {
         assert_eq!(action, PlannedAction::Error);
         let r = reason.unwrap();
         assert!(r.contains("different size"), "reason was: {}", r);
+    }
+
+    #[test]
+    fn dest_index_finds_file_in_nested_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("2026").join("2026-05-03");
+        write_file(&nested.join("DSC04290.ARW"), 100);
+
+        let idx = DestIndex::build(&[tmp.path()]);
+        assert_eq!(idx.len(), 1);
+        let hit = idx.lookup("DSC04290.ARW", 100).unwrap();
+        assert_eq!(hit, nested.join("DSC04290.ARW"));
+    }
+
+    #[test]
+    fn dest_index_lookup_is_case_insensitive() {
+        let tmp = tempfile::tempdir().unwrap();
+        // On-disk lowercase, query uppercase.
+        write_file(&tmp.path().join("2026").join("dsc04290.arw"), 100);
+
+        let idx = DestIndex::build(&[tmp.path()]);
+        assert!(idx.lookup("DSC04290.ARW", 100).is_some());
+        assert!(idx.lookup("dsc04290.arw", 100).is_some());
+    }
+
+    #[test]
+    fn dest_index_size_mismatch_is_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(&tmp.path().join("DSC04290.ARW"), 100);
+
+        let idx = DestIndex::build(&[tmp.path()]);
+        assert!(idx.lookup("DSC04290.ARW", 100).is_some());
+        assert!(idx.lookup("DSC04290.ARW", 99).is_none());
+    }
+
+    #[test]
+    fn dest_index_handles_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let does_not_exist = tmp.path().join("not-here");
+        let idx = DestIndex::build(&[does_not_exist.as_path()]);
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn dest_index_merges_two_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let images = tmp.path().join("images");
+        let videos = tmp.path().join("videos");
+        write_file(&images.join("2026").join("DSC04290.ARW"), 100);
+        write_file(&videos.join("2026").join("C0001.MP4"), 200);
+
+        let idx = DestIndex::build(&[images.as_path(), videos.as_path()]);
+        assert_eq!(idx.len(), 2);
+        assert!(idx.lookup("DSC04290.ARW", 100).is_some());
+        assert!(idx.lookup("C0001.MP4", 200).is_some());
     }
 }

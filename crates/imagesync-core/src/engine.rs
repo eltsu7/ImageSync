@@ -132,6 +132,55 @@ async fn run_scan_and_plan(
         "classified files for metadata read"
     );
 
+    // Pre-skip: build a recursive index of the destination roots and skip
+    // any non-sidecar file whose (basename, size) already exists somewhere
+    // in the library. This avoids running exiftool on files we'd skip
+    // anyway, which is the dominant cost on partially-imported cards.
+    // Sidecars are always small and rare; we leave them in the metadata
+    // path so they can inherit their parent's datetime correctly.
+    let dest_index =
+        plan::DestIndex::build(&[cfg.images_root.as_path(), cfg.videos_root.as_path()]);
+    tracing::debug!(
+        indexed = dest_index.len(),
+        "built destination index for pre-skip"
+    );
+
+    let mut pre_skipped: Vec<PlannedFile> = Vec::new();
+    let mut filtered_to_meta: Vec<crate::source::SourceFile> = Vec::new();
+    let mut filtered_kinds: Vec<classify::MediaKind> = Vec::new();
+    for (f, k) in to_meta.into_iter().zip(kinds) {
+        let basename = f
+            .rel_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(f.rel_path.as_str());
+        if !k.is_sidecar() {
+            if let Some(existing) = dest_index.lookup(basename, f.size) {
+                pre_skipped.push(PlannedFile {
+                    source: source.id().clone(),
+                    source_rel_path: f.rel_path.clone(),
+                    source_size: f.size,
+                    kind: crate::events::MediaKindWire::from(k),
+                    action: PlannedAction::SkipExists,
+                    dest_path: Some(existing.to_path_buf()),
+                    datetime: None,
+                    date_source: None,
+                    reason: Some("already in library (pre-skip index)".into()),
+                });
+                continue;
+            }
+        }
+        filtered_to_meta.push(f);
+        filtered_kinds.push(k);
+    }
+    let to_meta = filtered_to_meta;
+    let kinds = filtered_kinds;
+    tracing::debug!(
+        pre_skipped = pre_skipped.len(),
+        remaining = to_meta.len(),
+        "pre-skip filter applied"
+    );
+
     // Resolve filesystem paths for each.
     let mut paths: Vec<PathBuf> = Vec::with_capacity(to_meta.len());
     for f in &to_meta {
@@ -189,7 +238,11 @@ async fn run_scan_and_plan(
     }
 
     // Build plan.
-    let plan = plan::build_plan(&cfg, profile, scanned)?;
+    let mut plan = plan::build_plan(&cfg, profile, scanned)?;
+
+    // Merge pre-skipped items into the final plan. Order doesn't matter
+    // for correctness; later UI groups by destination dir anyway.
+    plan.items.extend(pre_skipped);
 
     let _ = tx
         .send(EngineEvent::PlanReady {

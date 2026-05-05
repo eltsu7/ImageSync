@@ -6,9 +6,11 @@
 
 ## Performance
 
-- [ ] **Speed up metadata / image discovery.** Scan + exiftool batch
-      currently takes ~21 s on a 1232-file Sony a7 IV card. Options to
-      investigate, in roughly increasing complexity:
+- [ ] **Speed up metadata / image discovery for fresh cards.** A
+      partially-imported card is now fast (pre-skip index — see Recently
+      closed). The fresh-card case (everything must be exiftool'd) is
+      still ~21 s on 1232 Sony a7 IV files. Options, in roughly
+      increasing complexity:
   - Run multiple exiftool stay-open processes in parallel (one per
     `scan_workers`). Each handles a slice of the file list.
   - Use an embedded EXIF parser (`kamadak-exif`, `little_exif`, or
@@ -149,6 +151,10 @@
 
 ## Recently closed
 
+- `60848cb` — Pre-skip index: build `DestIndex` over `images_root` +
+  `videos_root` and skip already-imported files before exiftool runs.
+  ~4× scan speedup on partially-imported cards. Bonus: dedupe survives
+  path-template changes.
 - `a99aec9` — TUI: show real numbers + 'Cancelled' heading after sync abort.
 - `c194af0` — Default copy_workers from 2 to 1.
 - `58d14d8` — Copy: run blocking std::fs inside a single spawn_blocking.

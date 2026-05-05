@@ -98,6 +98,13 @@ metadata) so the channel never fills under normal load.
 detect mounts ──► profile match ──► walk filesystem ──► classify by ext
                                               │
                                               ▼
+                                  build DestIndex (recursive)
+                                              │
+                                              ▼
+                          pre-skip files where (basename, size)
+                          already exists anywhere in the library
+                                              │
+                                              ▼
                                   exiftool batch (50 files)
                                               │
                                               ▼
@@ -124,23 +131,37 @@ Steps:
    classifies each file as `Image { raw }`, `Video`, `Sidecar`, or
    ignored. RAW filter (`RawMode::All | RawOnly | NonRawOnly`) and
    include flags (`include_videos`, `include_sidecars`) gate inclusion.
-5. **Metadata batch** (`metadata.rs` + `exiftool.rs`). ExifTool is
-   spawned once with `-stay_open True -@ -`. Files are batched (default
-   50) and submitted via `-execute<n>` / `{ready<n>}` markers.
-   Significantly faster than spawning exiftool per file (~60×).
-6. **Datetime resolution** (`metadata.rs`). For each file the resolver
+5. **Pre-skip index** (`plan.rs::DestIndex`). Recursive walk of
+   `images_root` and `videos_root` builds
+   `HashMap<(lowercase basename, size), PathBuf>`. Any non-sidecar
+   source file whose `(basename, size)` is in the index is emitted
+   directly as `SkipExists` with `datetime: None` and the matched
+   on-disk path as `dest_path`. This avoids running exiftool on files
+   we'd skip anyway — the dominant cost on partially-imported cards
+   (~4× scan speedup measured on a 1232-file Sony α7 IV card with
+   1010 already imported). Sidecars are intentionally excluded so they
+   can still inherit their parent's datetime in the normal path.
+6. **Metadata batch** (`metadata.rs` + `exiftool.rs`). ExifTool is
+   spawned once with `-stay_open True -@ -`. Only files that survived
+   the pre-skip filter are batched (default 50) and submitted via
+   `-execute<n>` / `{ready<n>}` markers. Significantly faster than
+   spawning exiftool per file (~60×).
+7. **Datetime resolution** (`metadata.rs`). For each file the resolver
    tries `DateTimeOriginal`, `CreateDate`, file mtime in that order.
    Sidecars inherit their parent's datetime.
-7. **Path template** (`template.rs`). Tokens: `yyyy yy mm dd month
+8. **Path template** (`template.rs`). Tokens: `yyyy yy mm dd month
    Month HH MM SS`. Parsed to an AST at config-load and re-applied per
    file.
-8. **Plan build** (`plan.rs`). Compute the destination path. Look up
+9. **Plan build** (`plan.rs`). Compute the destination path. Look up
    the parent dir in a `DirCache` (one `read_dir` per dir, lowercased
    basenames hashmap). Decide:
    - exact basename hit, same size → `SkipExists`
    - exact basename hit, different size → `Error` ("size mismatch")
    - case-different basename hit, same size → `SkipExists`
    - no hit → `Copy`
+
+   Pre-skipped items (step 5) are appended to the final
+   `SyncPlan.items` after `build_plan` returns.
 
 ### 4.2 Execute
 
@@ -385,7 +406,7 @@ Two profiles ship:
 
 ## 8. Testing
 
-- `cargo test` — 29 unit tests across 5 suites.
+- `cargo test` — 34 unit tests across 5 suites.
 - ExifTool 13.50+ must be on `PATH` for the binary; tests that need it
   are gated with `#[ignore]` so `cargo test` works in CI without it.
 - TUI smoke tests use Python's `pty.fork()` to drive a real terminal.
@@ -400,14 +421,16 @@ card, 1232 files, ~30 GB), copying to `/media/Pictures/` (ext4):
 
 | Stage | Old | New | Notes |
 |---|---|---|---|
-| Scan + metadata (1232 files) | ~21 s | ~21 s | Dominated by exiftool I/O. Batch size 50→25 progress events. |
+| Scan + metadata, fresh card (1232 files, 0 already imported) | ~21 s | ~21 s | Dominated by exiftool I/O. |
+| Scan + metadata, partial card (1232 files, 1010 already imported) | ~21 s | ~5 s (expected) | Pre-skip index removes already-imported files from the exiftool batch. See 4.1 step 5. |
 | Copy 222 files | TODO measure | TODO measure | Was tokio::fs spawn-blocking-per-chunk; now one spawn_blocking per file. |
 
 Bottleneck inventory:
 
-- Scan: file walk and exiftool throughput. Already batched; further
-  speedup needs concurrent exiftool processes or an embedded EXIF
-  parser. See TODO.
+- Scan, fresh card: file walk and exiftool throughput. Already batched;
+  further speedup needs concurrent exiftool processes or an embedded
+  EXIF parser. See TODO.
+- Scan, partial card: handled by the `DestIndex` pre-skip pass.
 - Plan: `read_dir` per destination directory. Cached in `DirCache`.
 - Copy: SD-card USB read speed (~30–100 MB/s for class-10).
 
