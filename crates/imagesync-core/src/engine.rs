@@ -125,6 +125,7 @@ async fn run_scan_and_plan(
         .await;
 
     // Classify and split into "needs metadata" vs "skip".
+    let t_classify_start = std::time::Instant::now();
     let mut to_meta: Vec<crate::source::SourceFile> = Vec::new();
     let mut kinds: Vec<classify::MediaKind> = Vec::new();
     for f in files {
@@ -137,6 +138,7 @@ async fn run_scan_and_plan(
     tracing::debug!(
         profile = profile.id,
         count = to_meta.len(),
+        elapsed_ms = t_classify_start.elapsed().as_millis() as u64,
         "classified files for metadata read"
     );
 
@@ -146,13 +148,16 @@ async fn run_scan_and_plan(
     // anyway, which is the dominant cost on partially-imported cards.
     // Sidecars are always small and rare; we leave them in the metadata
     // path so they can inherit their parent's datetime correctly.
+    let t_index_start = std::time::Instant::now();
     let dest_index =
         plan::DestIndex::build(&[cfg.images_root.as_path(), cfg.videos_root.as_path()]);
     tracing::debug!(
         indexed = dest_index.len(),
+        elapsed_ms = t_index_start.elapsed().as_millis() as u64,
         "built destination index for pre-skip"
     );
 
+    let t_filter_start = std::time::Instant::now();
     let mut pre_skipped: Vec<PlannedFile> = Vec::new();
     let mut filtered_to_meta: Vec<crate::source::SourceFile> = Vec::new();
     let mut filtered_kinds: Vec<classify::MediaKind> = Vec::new();
@@ -186,16 +191,24 @@ async fn run_scan_and_plan(
     tracing::debug!(
         pre_skipped = pre_skipped.len(),
         remaining = to_meta.len(),
+        elapsed_ms = t_filter_start.elapsed().as_millis() as u64,
         "pre-skip filter applied"
     );
 
     // Resolve filesystem paths for each.
+    let t_resolve_start = std::time::Instant::now();
     let mut paths: Vec<PathBuf> = Vec::with_capacity(to_meta.len());
     for f in &to_meta {
         paths.push(source.full_path(f).await?);
     }
+    tracing::debug!(
+        count = paths.len(),
+        elapsed_ms = t_resolve_start.elapsed().as_millis() as u64,
+        "resolved source paths"
+    );
 
     // Read metadata in batches via a stay_open exiftool process.
+    let t_meta_start = std::time::Instant::now();
     let exif = ExifTool::spawn().await?;
     let batch_size = cfg.performance.metadata_batch_size.max(1);
     let mut metas: Vec<Option<metadata::ResolvedMetadata>> = Vec::with_capacity(to_meta.len());
@@ -215,6 +228,19 @@ async fn run_scan_and_plan(
             .await;
     }
     let _ = exif.shutdown().await;
+    let meta_elapsed_ms = t_meta_start.elapsed().as_millis() as u64;
+    let per_file_us = if !paths.is_empty() {
+        (meta_elapsed_ms as f64 * 1000.0 / paths.len() as f64) as u64
+    } else {
+        0
+    };
+    tracing::debug!(
+        files = paths.len(),
+        batch_size,
+        elapsed_ms = meta_elapsed_ms,
+        per_file_us,
+        "metadata batch complete"
+    );
 
     // Build ScannedFile list.
     let mut scanned: Vec<ScannedFile> = Vec::with_capacity(to_meta.len());
