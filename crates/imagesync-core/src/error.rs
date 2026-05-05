@@ -37,6 +37,12 @@ pub enum Error {
     #[error("source error: {0}")]
     Source(String),
 
+    #[error("destination root not found: {path} ({kind}). Create it with `mkdir -p {path}`, or check that the drive is mounted.")]
+    DestRootMissing { path: PathBuf, kind: &'static str },
+
+    #[error("destination root is not a directory: {path} ({kind})")]
+    DestRootNotDir { path: PathBuf, kind: &'static str },
+
     #[error("toml parse error: {0}")]
     TomlDe(#[from] toml::de::Error),
 

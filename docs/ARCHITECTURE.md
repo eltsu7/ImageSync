@@ -94,6 +94,16 @@ metadata) so the channel never fills under normal load.
 
 ### 4.1 Scan & plan
 
+`run_scan_and_plan` opens with a pre-flight check that both
+`images_root` and `videos_root` exist as directories
+(`engine.rs::check_dest_root`). Empty directories are accepted
+(legitimate first-time setup); missing paths or non-directories return
+`Error::DestRootMissing` / `Error::DestRootNotDir`. This catches the
+"drive isn't mounted" footgun where every source file would otherwise
+be misclassified as new. `run_execute` repeats the check (skipped on
+dry-run) so a plan that's been kept around between scan and sync can't
+land on an unmounted root either.
+
 ```
 detect mounts ──► profile match ──► walk filesystem ──► classify by ext
                                               │
@@ -406,7 +416,7 @@ Two profiles ship:
 
 ## 8. Testing
 
-- `cargo test` — 34 unit tests across 5 suites.
+- `cargo test` — 38 unit tests across 5 suites.
 - ExifTool 13.50+ must be on `PATH` for the binary; tests that need it
   are gated with `#[ignore]` so `cargo test` works in CI without it.
 - TUI smoke tests use Python's `pty.fork()` to drive a real terminal.

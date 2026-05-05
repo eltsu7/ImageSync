@@ -97,6 +97,14 @@ async fn run_scan_and_plan(
     source: Arc<dyn MediaSource>,
     tx: mpsc::Sender<EngineEvent>,
 ) -> Result<SyncPlan> {
+    // Pre-flight: refuse to run if the destination roots aren't reachable.
+    // This catches the common "drive isn't mounted" footgun where every
+    // file would otherwise look new, get copied to an empty mount point,
+    // and disappear when the real drive mounts. Bare existence check —
+    // empty directories are accepted (legitimate first-time setup).
+    check_dest_root(&cfg.images_root, "images_root")?;
+    check_dest_root(&cfg.videos_root, "videos_root")?;
+
     let _ = tx
         .send(EngineEvent::ScanStarted {
             source: source.id().clone(),
@@ -264,6 +272,14 @@ async fn run_execute(
 ) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::Semaphore;
+
+    // Re-check destination roots before any copy. Defensive: scan_and_plan
+    // already checked, but plans can be persisted/replayed and roots can
+    // be unmounted between scan and execute.
+    if !opts.dry_run {
+        check_dest_root(&cfg.images_root, "images_root")?;
+        check_dest_root(&cfg.videos_root, "videos_root")?;
+    }
 
     let workers = cfg.performance.copy_workers.max(1);
     let sem = Arc::new(Semaphore::new(workers));
@@ -443,4 +459,74 @@ async fn resolve_full_path(
         backend_handle: BackendHandle::Path(p.clone()),
     };
     source.full_path(&sf).await
+}
+
+/// Verify a configured destination root exists as a directory. Empty
+/// directories are accepted (legitimate first-time setup); non-existent
+/// paths and non-directories (e.g. a regular file at that path) are
+/// rejected. Catches the "drive not mounted" footgun where every source
+/// file would otherwise be misclassified as new.
+fn check_dest_root(path: &std::path::Path, kind: &'static str) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(crate::error::Error::DestRootNotDir {
+            path: path.to_path_buf(),
+            kind,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(crate::error::Error::DestRootMissing {
+                path: path.to_path_buf(),
+                kind,
+            })
+        }
+        Err(e) => Err(crate::error::Error::io(path, e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_dest_root_accepts_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        check_dest_root(tmp.path(), "images_root").unwrap();
+    }
+
+    #[test]
+    fn check_dest_root_accepts_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        check_dest_root(&empty, "images_root").unwrap();
+    }
+
+    #[test]
+    fn check_dest_root_rejects_missing_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = check_dest_root(&missing, "videos_root").unwrap_err();
+        match err {
+            crate::error::Error::DestRootMissing { kind, path } => {
+                assert_eq!(kind, "videos_root");
+                assert_eq!(path, missing);
+            }
+            other => panic!("expected DestRootMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_dest_root_rejects_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a-file");
+        std::fs::write(&file, b"not a dir").unwrap();
+        let err = check_dest_root(&file, "images_root").unwrap_err();
+        match err {
+            crate::error::Error::DestRootNotDir { kind, path } => {
+                assert_eq!(kind, "images_root");
+                assert_eq!(path, file);
+            }
+            other => panic!("expected DestRootNotDir, got {other:?}"),
+        }
+    }
 }

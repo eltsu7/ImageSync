@@ -151,6 +151,11 @@
 
 ## Recently closed
 
+- `de375ac` — Engine: pre-flight check that `images_root` and
+  `videos_root` exist as directories. Catches the "drive isn't
+  mounted" footgun where every source file would otherwise look new
+  and get copied to an empty mount point. New errors:
+  `DestRootMissing` and `DestRootNotDir`.
 - `60848cb` — Pre-skip index: build `DestIndex` over `images_root` +
   `videos_root` and skip already-imported files before exiftool runs.
   ~4× scan speedup on partially-imported cards. Bonus: dedupe survives
