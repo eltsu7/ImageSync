@@ -118,6 +118,20 @@ impl DestField {
 type ScanResult = Result<(SyncPlan, Arc<dyn MediaSource>), String>;
 type ScanHandle = tokio::task::JoinHandle<ScanResult>;
 
+/// Hard cap on rendered worker lanes. Beyond this we'd eat the whole
+/// screen with progress bars; high-worker-count users still see the
+/// total-progress gauge and the log.
+const MAX_VISIBLE_SLOTS: usize = 8;
+
+/// One in-flight copy in the sync screen. Identified by `rel_path` so
+/// `CopyProgress` events can find the right lane.
+#[derive(Debug, Clone)]
+struct CopySlot {
+    rel_path: String,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
 struct App {
     cfg: AppConfig,
     cfg_path: PathBuf,
@@ -170,8 +184,10 @@ struct App {
     sync_failed: u64,
     sync_skipped: u64,
     sync_log: Vec<String>,
-    sync_current: Option<String>,
-    sync_current_progress: Option<(u64, u64)>,
+    /// One slot per copy worker (lane). `Some` when that lane is
+    /// actively copying a file, `None` when idle. Sized at sync-start
+    /// from `cfg.performance.copy_workers`, capped at `MAX_VISIBLE_SLOTS`.
+    sync_slots: Vec<Option<CopySlot>>,
     dry_run: bool,
 
     // Final summary
@@ -240,8 +256,7 @@ impl App {
             sync_failed: 0,
             sync_skipped: 0,
             sync_log: Vec::new(),
-            sync_current: None,
-            sync_current_progress: None,
+            sync_slots: Vec::new(),
             dry_run: false,
             summary_copied: 0,
             summary_skipped: 0,
@@ -406,44 +421,107 @@ impl App {
     fn on_sync_event(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::CopyStarted { file } => {
-                self.sync_current = Some(file.source_rel_path);
-                self.sync_current_progress = Some((0, file.source_size));
+                self.start_slot(file.source_rel_path, file.source_size);
             }
             EngineEvent::CopyProgress { rel_path, bytes_done, bytes_total } => {
-                self.sync_current = Some(rel_path);
-                self.sync_current_progress = Some((bytes_done, bytes_total));
+                self.update_slot(&rel_path, bytes_done, bytes_total);
             }
-            EngineEvent::CopyComplete { file, outcome } => match outcome {
-                CopyOutcome::Copied { .. } => {
-                    if file.action == PlannedAction::Copy {
-                        self.sync_done_copy += 1;
+            EngineEvent::CopyComplete { file, outcome } => {
+                self.free_slot(&file.source_rel_path);
+                match outcome {
+                    CopyOutcome::Copied { .. } => {
+                        if file.action == PlannedAction::Copy {
+                            self.sync_done_copy += 1;
+                        }
+                        push_log(
+                            &mut self.sync_log,
+                            format!(" OK   {}", file.source_rel_path),
+                        );
                     }
-                    push_log(
-                        &mut self.sync_log,
-                        format!(" OK   {}", file.source_rel_path),
-                    );
+                    CopyOutcome::Skipped { reason } => {
+                        self.sync_skipped += 1;
+                        push_log(
+                            &mut self.sync_log,
+                            format!(" SKIP {} ({reason})", file.source_rel_path),
+                        );
+                    }
+                    CopyOutcome::Failed { error } => {
+                        self.sync_failed += 1;
+                        push_log(
+                            &mut self.sync_log,
+                            format!(" FAIL {} ({error})", file.source_rel_path),
+                        );
+                    }
                 }
-                CopyOutcome::Skipped { reason } => {
-                    self.sync_skipped += 1;
-                    push_log(
-                        &mut self.sync_log,
-                        format!(" SKIP {} ({reason})", file.source_rel_path),
-                    );
-                }
-                CopyOutcome::Failed { error } => {
-                    self.sync_failed += 1;
-                    push_log(
-                        &mut self.sync_log,
-                        format!(" FAIL {} ({error})", file.source_rel_path),
-                    );
-                }
-            },
+            }
             EngineEvent::SyncSummary { copied, skipped, failed } => {
                 self.summary_copied = copied;
                 self.summary_skipped = skipped;
                 self.summary_failed = failed;
             }
             _ => {}
+        }
+    }
+
+    /// Assign a starting copy to a free lane. If `rel_path` is already
+    /// shown (shouldn't happen but be defensive), reuse that lane.
+    /// Falls back to overwriting the oldest-looking lane if all are
+    /// busy — the engine semaphore caps in-flight copies at
+    /// `copy_workers`, so this only fires if `MAX_VISIBLE_SLOTS` was
+    /// hit on a high-worker-count config.
+    fn start_slot(&mut self, rel_path: String, bytes_total: u64) {
+        if let Some(slot) = self
+            .sync_slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.rel_path == rel_path)
+        {
+            slot.bytes_done = 0;
+            slot.bytes_total = bytes_total;
+            return;
+        }
+        if let Some(empty) = self.sync_slots.iter_mut().find(|s| s.is_none()) {
+            *empty = Some(CopySlot {
+                rel_path,
+                bytes_done: 0,
+                bytes_total,
+            });
+            return;
+        }
+        // All lanes full. Replace the slot whose copy is closest to
+        // done — it'll free itself imminently anyway and this keeps
+        // the screen showing fresh activity.
+        if let Some(victim) = self
+            .sync_slots
+            .iter_mut()
+            .max_by_key(|s| s.as_ref().map(pct_x1000).unwrap_or(0))
+        {
+            *victim = Some(CopySlot {
+                rel_path,
+                bytes_done: 0,
+                bytes_total,
+            });
+        }
+    }
+
+    fn update_slot(&mut self, rel_path: &str, bytes_done: u64, bytes_total: u64) {
+        if let Some(slot) = self
+            .sync_slots
+            .iter_mut()
+            .flatten()
+            .find(|s| s.rel_path == rel_path)
+        {
+            slot.bytes_done = bytes_done;
+            slot.bytes_total = bytes_total;
+        }
+    }
+
+    fn free_slot(&mut self, rel_path: &str) {
+        for slot in self.sync_slots.iter_mut() {
+            if slot.as_ref().is_some_and(|c| c.rel_path == rel_path) {
+                *slot = None;
+                return;
+            }
         }
     }
 
@@ -829,8 +907,7 @@ impl App {
         self.sync_failed = 0;
         self.sync_skipped = 0;
         self.sync_log.clear();
-        self.sync_current = None;
-        self.sync_current_progress = None;
+        self.sync_slots.clear();
         self.summary_copied = 0;
         self.summary_skipped = 0;
         self.summary_failed = 0;
@@ -905,8 +982,12 @@ impl App {
         self.sync_failed = 0;
         self.sync_skipped = 0;
         self.sync_log.clear();
-        self.sync_current = None;
-        self.sync_current_progress = None;
+        let lanes = self
+            .cfg
+            .performance
+            .copy_workers
+            .clamp(1, MAX_VISIBLE_SLOTS);
+        self.sync_slots = vec![None; lanes];
         self.summary_copied = 0;
         self.summary_skipped = 0;
         self.summary_failed = 0;
@@ -1405,13 +1486,25 @@ impl App {
     // ------- Screen: Sync -------
 
     fn render_sync(&self, f: &mut Frame, area: Rect) {
+        // Decide how many lanes we can fit. Each lane needs 3 rows
+        // (border + bar + border). Total gauge takes 3, log needs at
+        // least 3.
+        let lanes_requested = self.sync_slots.len();
+        let max_fit = (area.height as usize)
+            .saturating_sub(3 + 3) // total + min log
+            / 3;
+        let lanes_visible = lanes_requested.min(max_fit).max(1);
+        let lanes_hidden = lanes_requested.saturating_sub(lanes_visible);
+
+        let mut constraints: Vec<Constraint> = Vec::with_capacity(lanes_visible + 2);
+        constraints.push(Constraint::Length(3)); // total
+        for _ in 0..lanes_visible {
+            constraints.push(Constraint::Length(3));
+        }
+        constraints.push(Constraint::Min(3)); // log
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // total
-                Constraint::Length(3), // current file
-                Constraint::Min(3),    // log
-            ])
+            .constraints(constraints)
             .split(area);
 
         // Total progress
@@ -1422,10 +1515,13 @@ impl App {
         } else {
             1.0
         };
-        let total_label = format!(
+        let mut total_label = format!(
             "{}/{} copied · {} failed · {} skipped",
             self.sync_done_copy, self.sync_total_copy, self.sync_failed, self.sync_skipped
         );
+        if lanes_hidden > 0 {
+            total_label.push_str(&format!(" · +{lanes_hidden} more lanes hidden"));
+        }
         let total_gauge = Gauge::default()
             .block(
                 Block::default().borders(Borders::ALL).title(if self.dry_run {
@@ -1439,24 +1535,34 @@ impl App {
             .label(total_label);
         f.render_widget(total_gauge, rows[0]);
 
-        // Current file
-        let (cur_pct, cur_label) = match (&self.sync_current, self.sync_current_progress) {
-            (Some(name), Some((done, total))) if total > 0 => (
-                (done as f64 / total as f64).min(1.0),
-                format!("{name}  {}/{}", human_bytes(done), human_bytes(total)),
-            ),
-            (Some(name), _) => (0.0, name.clone()),
-            _ => (0.0, "(idle)".to_string()),
-        };
-        let cur = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" current "))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(cur_pct)
-            .label(cur_label);
-        f.render_widget(cur, rows[1]);
+        // Per-lane gauges
+        for i in 0..lanes_visible {
+            let area = rows[1 + i];
+            let title = format!(" worker {} ", i + 1);
+            let (lane_pct, lane_label) = match self.sync_slots.get(i).and_then(|s| s.as_ref()) {
+                Some(slot) if slot.bytes_total > 0 => (
+                    (slot.bytes_done as f64 / slot.bytes_total as f64).min(1.0),
+                    format!(
+                        "{}  {}/{}",
+                        slot.rel_path,
+                        human_bytes(slot.bytes_done),
+                        human_bytes(slot.bytes_total)
+                    ),
+                ),
+                Some(slot) => (0.0, slot.rel_path.clone()),
+                None => (0.0, "(idle)".to_string()),
+            };
+            let g = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .ratio(lane_pct)
+                .label(lane_label);
+            f.render_widget(g, area);
+        }
 
         // Log (last N lines)
-        let log_h = rows[2].height.saturating_sub(2) as usize;
+        let log_area = rows[1 + lanes_visible];
+        let log_h = log_area.height.saturating_sub(2) as usize;
         let take = self.sync_log.len().saturating_sub(log_h);
         let body: Vec<Line> = self.sync_log[take..]
             .iter()
@@ -1474,7 +1580,7 @@ impl App {
         f.render_widget(
             Paragraph::new(body)
                 .block(Block::default().borders(Borders::ALL).title(" log ")),
-            rows[2],
+            log_area,
         );
     }
 
@@ -1527,6 +1633,15 @@ fn push_log(buf: &mut Vec<String>, s: String) {
     if buf.len() > MAX {
         let drop = buf.len() - MAX;
         buf.drain(..drop);
+    }
+}
+
+/// Slot completion percentage scaled to 0..=1000 for ordinal compare
+/// (used to pick the most-done slot to evict when over-subscribed).
+fn pct_x1000(slot: &CopySlot) -> u64 {
+    match slot.bytes_done.saturating_mul(1000).checked_div(slot.bytes_total) {
+        Some(v) => v.min(1000),
+        None => 0,
     }
 }
 
