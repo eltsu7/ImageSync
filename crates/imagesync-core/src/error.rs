@@ -43,6 +43,9 @@ pub enum Error {
     #[error("destination root is not a directory: {path} ({kind})")]
     DestRootNotDir { path: PathBuf, kind: &'static str },
 
+    #[error("another ImageSync import is already using destination root: {path}")]
+    DestinationLocked { path: PathBuf },
+
     #[error("toml parse error: {0}")]
     TomlDe(#[from] toml::de::Error),
 

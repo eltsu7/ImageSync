@@ -138,6 +138,57 @@ where
     Ok(total)
 }
 
+/// Move a staged file into its final destination.
+///
+/// Staging lives under the destination root, so this is normally a metadata-only
+/// `rename` on the same filesystem (free, atomic-on-visibility). Falls back to
+/// copy+remove if the rename crosses a filesystem boundary (`EXDEV`) — defensive
+/// for unusual mount layouts.
+pub async fn finalize_move(staged: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| Error::io(parent, e))?;
+    }
+    let staged = staged.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        match std::fs::rename(&staged, &dest) {
+            Ok(()) => Ok(()),
+            Err(e) if is_cross_device(&e) => {
+                // Cross-filesystem: copy then remove the source.
+                std::fs::copy(&staged, &dest).map_err(|e| Error::io(&dest, e))?;
+                let _ = std::fs::remove_file(&staged);
+                Ok(())
+            }
+            Err(e) => Err(Error::io(&dest, e)),
+        }
+    })
+    .await
+    .map_err(|e| Error::IoBare(std::io::Error::other(format!("move task panicked: {e}"))))?
+}
+
+#[cfg(unix)]
+fn is_cross_device(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc_exdev())
+}
+
+#[cfg(not(unix))]
+fn is_cross_device(e: &std::io::Error) -> bool {
+    // Windows rename across volumes yields ERROR_NOT_SAME_DEVICE (17).
+    e.raw_os_error() == Some(17)
+}
+
+#[cfg(unix)]
+fn libc_exdev() -> i32 {
+    18 // EXDEV on Linux/macOS/BSD
+}
+
+#[cfg(test)]
+pub(crate) fn is_cross_device_for_test(e: &std::io::Error) -> bool {
+    is_cross_device(e)
+}
+
 fn hash_file_xxh3_blocking(path: &Path) -> Result<u64> {
     let mut f = File::open(path).map_err(|e| Error::io(path, e))?;
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();

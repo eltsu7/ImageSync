@@ -270,18 +270,12 @@ async fn run_scan_or_sync(
         println!("  {k:<16} {v}");
     }
 
+    // The cheap plan doesn't know destination folders yet (EXIF is read at
+    // copy time). List the planned actions per file; exact destinations are
+    // printed by the run below.
     println!();
     let max_show = 50usize;
     for item in plan.items.iter().take(max_show) {
-        let dest = item
-            .dest_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let date = item
-            .datetime
-            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "-".to_string());
         let action = match item.action {
             PlannedAction::Copy => "COPY",
             PlannedAction::SkipExists => "SKIP-EXISTS",
@@ -289,28 +283,31 @@ async fn run_scan_or_sync(
             PlannedAction::SkipNoDate => "SKIP-NODATE",
             PlannedAction::Error => "ERROR",
         };
-        println!(
-            "  {action:<12} {} -> {} [{}]",
-            item.source_rel_path, dest, date
-        );
+        println!("  {action:<12} {}", item.source_rel_path);
     }
     if plan.items.len() > max_show {
         println!("  ... and {} more", plan.items.len() - max_show);
     }
 
-    if scan_only {
-        return Ok(());
-    }
-
+    // `scan` and `--dry-run` both resolve exact destinations via a dry run
+    // (exiftool over USB, writes nothing). A real `sync` resolves the date at
+    // copy time on the local staged copy.
+    let effective_dry = dry_run || scan_only;
     println!();
     println!(
-        "=== Executing{} ===",
-        if dry_run { " (dry run)" } else { "" }
+        "=== {} ===",
+        if effective_dry {
+            "Dry run (no files written)"
+        } else {
+            "Executing"
+        }
     );
     let exec = engine.execute(
         plan,
         source,
-        imagesync_core::engine::ExecuteOptions { dry_run },
+        imagesync_core::engine::ExecuteOptions {
+            dry_run: effective_dry,
+        },
     );
     drain_to_stderr(exec).await;
 

@@ -26,6 +26,7 @@ xxhash-rust.workspace = true
 sysinfo.workspace = true
 num_cpus.workspace = true
 once_cell.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

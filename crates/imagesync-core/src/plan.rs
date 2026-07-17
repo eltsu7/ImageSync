@@ -7,11 +7,17 @@ use std::path::{Path, PathBuf};
 use crate::classify::{self, MediaKind};
 use crate::config::EngineConfig;
 use crate::error::Result;
-use crate::events::{MediaKindWire, PlannedAction, PlannedFile};
-use crate::metadata::ResolvedMetadata;
+use crate::events::{DateSourceWire, MediaKindWire, PlannedAction, PlannedFile};
+use crate::metadata::{DateSource, ResolvedMetadata};
 use crate::profiles::CameraProfile;
 use crate::source::{SourceFile, SourceId};
 use crate::template::PathTemplate;
+
+/// Name of the per-root staging directory used by the copy→exif→move executor.
+/// Lives under each destination root so the final placement is a same-filesystem
+/// rename. Excluded from the pre-skip [`DestIndex`] so in-flight staged files
+/// don't masquerade as already-imported library members.
+pub const STAGING_DIR_NAME: &str = ".imagesync-staging";
 
 /// One scanned file with its (optional) resolved metadata.
 #[derive(Debug, Clone)]
@@ -24,7 +30,26 @@ pub struct ScannedFile {
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncPlan {
+    /// Per-file display rows: provisional copy candidates (no destination yet,
+    /// dated by mtime if available) plus already-decided skips/filters. Drives
+    /// the preview UI and the `copies/skips/errors` counts.
     pub items: Vec<PlannedFile>,
+    /// Copy units to execute (parent media + inherited sidecars), carrying the
+    /// full [`SourceFile`] needed to copy and date each file. Empty for plans
+    /// built by the over-USB [`build_plan`] path (dry-run / scan).
+    pub units: Vec<CopyUnit>,
+}
+
+/// A media file selected for copying, plus any sidecars that inherit its
+/// capture date. Produced by [`cheap_plan`] without reading EXIF — the date and
+/// destination are resolved later, at copy time, on the local staged file.
+#[derive(Debug, Clone)]
+pub struct CopyUnit {
+    pub parent: SourceFile,
+    pub parent_kind: MediaKind,
+    /// Sidecars (`.xmp` …) paired to `parent` by `(rel_dir, stem)`. Empty when
+    /// `parent` is itself an orphan sidecar.
+    pub sidecars: Vec<SourceFile>,
 }
 
 impl SyncPlan {
@@ -86,11 +111,7 @@ pub fn dest_path_for(
 /// with their parent image (same source-relative directory + same basename
 /// stem) and inherit the image's destination directory and datetime. Orphan
 /// sidecars are still planned, dated by their own metadata or mtime.
-pub fn build_plan(
-    cfg: &EngineConfig,
-    _profile: &CameraProfile,
-    scanned: Vec<ScannedFile>,
-) -> Result<SyncPlan> {
+pub fn build_plan(cfg: &EngineConfig, scanned: Vec<ScannedFile>) -> Result<SyncPlan> {
     // Separate sidecars from non-sidecars.
     let mut media: Vec<ScannedFile> = Vec::new();
     let mut sidecars: Vec<ScannedFile> = Vec::new();
@@ -128,7 +149,160 @@ pub fn build_plan(
         }
     }
 
-    Ok(SyncPlan { items })
+    Ok(SyncPlan {
+        items,
+        units: Vec::new(),
+    })
+}
+
+/// Classify, filter, pre-skip and pair sidecars **without reading EXIF**.
+///
+/// This is the fast path for the real `sync`: deciding *which* files to copy
+/// needs only `(basename, size)` (the pre-skip [`DestIndex`]) and the extension
+/// filters — never the capture date. The date and destination folder are
+/// resolved later, at copy time, on the local staged copy (see the engine's
+/// staging executor). Produces [`CopyUnit`]s to execute plus already-decided
+/// skip/filter rows for display.
+pub fn cheap_plan(
+    cfg: &EngineConfig,
+    profile: &CameraProfile,
+    source_id: &SourceId,
+    files: Vec<SourceFile>,
+    dest_index: &DestIndex,
+) -> CheapPlan {
+    let mut media: Vec<(SourceFile, MediaKind)> = Vec::new();
+    let mut sidecars: Vec<SourceFile> = Vec::new();
+    let mut decided: Vec<PlannedFile> = Vec::new();
+
+    for f in files {
+        let Some(kind) = classify::classify(profile, &f.extension) else {
+            continue; // unknown extension; ignore silently
+        };
+        if !classify::should_include(
+            kind,
+            cfg.filters.raw_mode,
+            cfg.filters.include_videos,
+            cfg.filters.include_sidecars,
+        ) {
+            decided.push(decided_skip(
+                source_id,
+                &f,
+                kind,
+                PlannedAction::SkipFiltered,
+                None,
+                "filtered by user settings",
+            ));
+            continue;
+        }
+        if kind.is_sidecar() {
+            // Sidecars are tiny and rare; they ride with their parent and are
+            // never pre-skipped here (they inherit the parent's date/dir).
+            sidecars.push(f);
+        } else {
+            let basename = file_name_of(&f.rel_path);
+            if let Some(existing) = dest_index.lookup(basename, f.size) {
+                decided.push(decided_skip(
+                    source_id,
+                    &f,
+                    kind,
+                    PlannedAction::SkipExists,
+                    Some(existing.to_path_buf()),
+                    "already in library (pre-skip index)",
+                ));
+                continue;
+            }
+            media.push((f, kind));
+        }
+    }
+
+    // Index surviving media by (rel_dir, stem) so sidecars can find a parent.
+    let mut media_index: HashMap<(String, String), usize> = HashMap::new();
+    for (i, (f, _)) in media.iter().enumerate() {
+        media_index.insert(stem_key(&f.rel_path), i);
+    }
+
+    let mut units: Vec<CopyUnit> = media
+        .into_iter()
+        .map(|(parent, parent_kind)| CopyUnit {
+            parent,
+            parent_kind,
+            sidecars: Vec::new(),
+        })
+        .collect();
+
+    for sf in sidecars {
+        match media_index.get(&stem_key(&sf.rel_path)) {
+            Some(&idx) => units[idx].sidecars.push(sf),
+            None => units.push(CopyUnit {
+                parent: sf,
+                parent_kind: MediaKind::Sidecar,
+                sidecars: Vec::new(),
+            }),
+        }
+    }
+
+    CheapPlan { units, decided }
+}
+
+/// Output of [`cheap_plan`]: copy units to execute plus already-decided rows.
+#[derive(Debug, Default)]
+pub struct CheapPlan {
+    pub units: Vec<CopyUnit>,
+    pub decided: Vec<PlannedFile>,
+}
+
+impl CheapPlan {
+    /// Flatten into a [`SyncPlan`] for preview/counting. Copy candidates carry a
+    /// provisional mtime date and no destination (resolved at copy time).
+    pub fn into_sync_plan(self, source_id: &SourceId) -> SyncPlan {
+        let mut items = Vec::new();
+        for u in &self.units {
+            items.push(provisional_copy(source_id, &u.parent, u.parent_kind));
+            for s in &u.sidecars {
+                items.push(provisional_copy(source_id, s, MediaKind::Sidecar));
+            }
+        }
+        items.extend(self.decided.iter().cloned());
+        SyncPlan {
+            items,
+            units: self.units,
+        }
+    }
+}
+
+fn provisional_copy(source_id: &SourceId, f: &SourceFile, kind: MediaKind) -> PlannedFile {
+    PlannedFile {
+        source: source_id.clone(),
+        source_rel_path: f.rel_path.clone(),
+        source_size: f.size,
+        kind: MediaKindWire::from(kind),
+        action: PlannedAction::Copy,
+        dest_path: None,
+        datetime: f.mtime,
+        date_source: f.mtime.map(|_| DateSourceWire::from(DateSource::FileMtime)),
+        reason: None,
+    }
+}
+
+fn decided_skip(
+    source_id: &SourceId,
+    f: &SourceFile,
+    kind: MediaKind,
+    action: PlannedAction,
+    dest_path: Option<PathBuf>,
+    reason: &str,
+) -> PlannedFile {
+    PlannedFile {
+        source: source_id.clone(),
+        source_rel_path: f.rel_path.clone(),
+        source_size: f.size,
+        kind: MediaKindWire::from(kind),
+        action,
+        dest_path,
+        datetime: None,
+        date_source: None,
+        reason: Some(reason.to_string()),
+    }
 }
 
 /// Compute (rel_dir, stem) key. `rel_path` uses `/` separators.
@@ -282,6 +456,25 @@ impl DirCache {
         let key = basename.to_lowercase();
         entries.as_ref().and_then(|m| m.get(&key).cloned())
     }
+
+    fn reserve(&mut self, dest: &Path, basename: &str, size: u64) {
+        let Some(parent) = dest.parent() else {
+            return;
+        };
+        let entries = self
+            .cache
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| read_dir_lowercase(parent));
+        let entries = entries.get_or_insert_with(HashMap::new);
+        entries.insert(
+            basename.to_lowercase(),
+            DirEntry {
+                actual_name: basename.to_string(),
+                size,
+                is_file: true,
+            },
+        );
+    }
 }
 
 fn read_dir_lowercase(dir: &Path) -> Option<HashMap<String, DirEntry>> {
@@ -361,6 +554,11 @@ fn walk_into(dir: &Path, out: &mut HashMap<(String, u64), PathBuf>) {
         let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
         if ft.is_dir() {
+            // Skip the staging area: files mid-copy there are not yet library
+            // members and must not pre-skip their own source.
+            if entry.file_name() == std::ffi::OsStr::new(STAGING_DIR_NAME) {
+                continue;
+            }
             walk_into(&path, out);
         } else if ft.is_file() {
             let Ok(meta) = entry.metadata() else { continue };
@@ -372,6 +570,36 @@ fn walk_into(dir: &Path, out: &mut HashMap<(String, u64), PathBuf>) {
             // valid answer.
             out.entry(key).or_insert(path);
         }
+    }
+}
+
+/// Per-directory dedupe cache for the staging executor. Wraps the private
+/// [`DirCache`] so the engine can decide copy/skip/error verdicts against the
+/// final date folder (resolved at copy time) without re-reading each directory.
+#[derive(Debug, Default)]
+pub struct DedupeCache {
+    inner: DirCache,
+}
+
+impl DedupeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide the action for a resolved destination and reserve its basename
+    /// when it is free. Reservations make same-run duplicate names behave like
+    /// already-existing files even before their staged copies are moved.
+    pub fn reserve(
+        &mut self,
+        dest: &Path,
+        source_name: &str,
+        source_size: u64,
+    ) -> (PlannedAction, Option<String>) {
+        let verdict = decide_action_with_reason(dest, source_name, source_size, &mut self.inner);
+        if verdict.0 == PlannedAction::Copy {
+            self.inner.reserve(dest, source_name, source_size);
+        }
+        verdict
     }
 }
 
@@ -454,10 +682,7 @@ mod tests {
     fn default_template_image_path() {
         let c = cfg("/photos", "/videos", "{yyyy}/{yyyy}-{mm}-{dd}");
         let p = dest_path_for(&c, MediaKind::Image { raw: true }, &dt(), "DSC00001.ARW").unwrap();
-        assert_eq!(
-            p,
-            PathBuf::from("/photos/2026/2026-05-03/DSC00001.ARW")
-        );
+        assert_eq!(p, PathBuf::from("/photos/2026/2026-05-03/DSC00001.ARW"));
     }
 
     #[test]
@@ -503,8 +728,7 @@ mod tests {
         let dest = tmp.path().join("DSC04290.ARW");
         write_file(&dest, 100);
         let mut cache = DirCache::default();
-        let (action, reason) =
-            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        let (action, reason) = decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
         assert_eq!(action, PlannedAction::SkipExists);
         assert!(reason.unwrap().contains("same size"));
     }
@@ -517,8 +741,7 @@ mod tests {
         write_file(&on_disk, 100);
         let dest = tmp.path().join("DSC04290.ARW");
         let mut cache = DirCache::default();
-        let (action, reason) =
-            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        let (action, reason) = decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
         assert_eq!(action, PlannedAction::SkipExists);
         let r = reason.unwrap();
         assert!(r.contains("different case"), "reason was: {}", r);
@@ -532,8 +755,7 @@ mod tests {
         write_file(&on_disk, 50);
         let dest = tmp.path().join("DSC04290.ARW");
         let mut cache = DirCache::default();
-        let (action, reason) =
-            decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
+        let (action, reason) = decide_action_with_reason(&dest, "DSC04290.ARW", 100, &mut cache);
         assert_eq!(action, PlannedAction::Error);
         let r = reason.unwrap();
         assert!(r.contains("different size"), "reason was: {}", r);
@@ -578,6 +800,131 @@ mod tests {
         let does_not_exist = tmp.path().join("not-here");
         let idx = DestIndex::build(&[does_not_exist.as_path()]);
         assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn dest_index_excludes_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A real library file, and a mid-copy file in the staging area.
+        write_file(&tmp.path().join("2026").join("IMG001.JPG"), 100);
+        write_file(
+            &tmp.path()
+                .join(STAGING_DIR_NAME)
+                .join("7")
+                .join("IMG002.JPG"),
+            200,
+        );
+
+        let idx = DestIndex::build(&[tmp.path()]);
+        assert!(idx.lookup("IMG001.JPG", 100).is_some());
+        // The staged file must NOT pre-skip its own source.
+        assert!(idx.lookup("IMG002.JPG", 200).is_none());
+        assert_eq!(idx.len(), 1);
+    }
+
+    fn src_file(rel: &str, size: u64, ext: &str) -> SourceFile {
+        use crate::source::BackendHandle;
+        SourceFile {
+            rel_path: rel.to_string(),
+            size,
+            mtime: NaiveDate::from_ymd_opt(2026, 5, 3)
+                .unwrap()
+                .and_hms_opt(9, 0, 0),
+            extension: ext.to_string(),
+            backend_handle: BackendHandle::Path(PathBuf::from(rel)),
+        }
+    }
+
+    #[test]
+    fn cheap_plan_pairs_sidecars_filters_and_preskips() {
+        use crate::profiles::ProfileRegistry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let images = tmp.path().join("images");
+        let videos = tmp.path().join("videos");
+        // An already-imported JPG so the pre-skip index has a hit.
+        write_file(&images.join("2026").join("OLD.JPG"), 10);
+        let dest_index = DestIndex::build(&[images.as_path(), videos.as_path()]);
+
+        let mut c = cfg(
+            images.to_str().unwrap(),
+            videos.to_str().unwrap(),
+            "{yyyy}/{yyyy}-{mm}-{dd}",
+        );
+        c.filters.raw_mode = RawMode::NonRawOnly; // RAW should be filtered out
+
+        let reg = ProfileRegistry::with_builtins().unwrap();
+        let profile = reg.get("dcim-generic").unwrap();
+        let sid = SourceId("s".into());
+
+        let files = vec![
+            src_file("DCIM/IMG001.JPG", 100, "jpg"),
+            src_file("DCIM/IMG001.XMP", 5, "xmp"), // sidecar of IMG001
+            src_file("DCIM/IMG002.ARW", 2000, "arw"), // filtered (non-raw-only)
+            src_file("DCIM/VID001.MP4", 9000, "mp4"),
+            src_file("DCIM/OLD.JPG", 10, "jpg"), // pre-skipped (in library)
+        ];
+
+        let cheap = cheap_plan(&c, profile, &sid, files, &dest_index);
+
+        // Units: IMG001 (with its sidecar) + VID001 = 2. ARW filtered, OLD pre-skipped.
+        assert_eq!(cheap.units.len(), 2);
+        let img = cheap
+            .units
+            .iter()
+            .find(|u| u.parent.rel_path == "DCIM/IMG001.JPG")
+            .unwrap();
+        assert_eq!(img.sidecars.len(), 1);
+        assert_eq!(img.sidecars[0].rel_path, "DCIM/IMG001.XMP");
+
+        // Decided: 1 filtered (ARW) + 1 pre-skipped (OLD).
+        assert_eq!(
+            cheap
+                .decided
+                .iter()
+                .filter(|p| p.action == PlannedAction::SkipFiltered)
+                .count(),
+            1
+        );
+        assert_eq!(
+            cheap
+                .decided
+                .iter()
+                .filter(|p| p.action == PlannedAction::SkipExists)
+                .count(),
+            1
+        );
+
+        // Preview plan: copy rows are provisional (no destination yet).
+        let plan = cheap.into_sync_plan(&sid);
+        assert_eq!(plan.copies(), 3); // IMG001.JPG, IMG001.XMP, VID001.MP4
+        for it in plan
+            .items
+            .iter()
+            .filter(|i| i.action == PlannedAction::Copy)
+        {
+            assert!(it.dest_path.is_none());
+        }
+    }
+
+    #[test]
+    fn dedupe_reservation_prevents_same_run_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp
+            .path()
+            .join("2026")
+            .join("2026-05-03")
+            .join("IMG0001.JPG");
+        let mut cache = DedupeCache::new();
+
+        assert_eq!(
+            cache.reserve(&dest, "IMG0001.JPG", 100).0,
+            PlannedAction::Copy
+        );
+        assert_eq!(
+            cache.reserve(&dest, "IMG0001.JPG", 100).0,
+            PlannedAction::SkipExists
+        );
     }
 
     #[test]

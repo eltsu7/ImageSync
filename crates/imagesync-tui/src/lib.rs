@@ -12,7 +12,7 @@
 //! input thread.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,18 +48,19 @@ pub async fn run() -> Result<()> {
     }
 
     let (app_cfg, cfg_path) = load_app_config()?;
-    let registry = ProfileRegistry::with_builtins()
-        .context("loading built-in camera profiles")?;
+    let registry = ProfileRegistry::with_builtins().context("loading built-in camera profiles")?;
 
     let mut terminal = ratatui::try_init().context("initialising terminal")?;
-    let result = App::new(app_cfg, cfg_path, registry).run(&mut terminal).await;
+    let result = App::new(app_cfg, cfg_path, registry)
+        .run(&mut terminal)
+        .await;
     ratatui::restore();
     result
 }
 
 fn load_app_config() -> Result<(AppConfig, PathBuf)> {
-    let path = AppConfig::default_path()
-        .context("could not determine config dir on this platform")?;
+    let path =
+        AppConfig::default_path().context("could not determine config dir on this platform")?;
     let cfg = AppConfig::load_or_default(&path)
         .with_context(|| format!("loading config from {}", path.display()))?;
     Ok((cfg, path))
@@ -170,6 +171,9 @@ struct App {
     scan_files_total: u64,
     meta_done: u64,
     meta_total: u64,
+    /// Set when a scan fails; keeps the Scan screen up showing the error
+    /// instead of silently flashing back to source select.
+    scan_error: Option<String>,
 
     // Review
     plan: Option<SyncPlan>,
@@ -243,6 +247,7 @@ impl App {
             scan_rx: None,
             scan_handle: None,
             scan_status: String::new(),
+            scan_error: None,
             scan_files_total: 0,
             meta_done: 0,
             meta_total: 0,
@@ -350,13 +355,13 @@ impl App {
                     self.scan_rx = None;
                 }
                 Ok(Err(msg)) => {
-                    self.status = Some(format!("scan failed: {msg}"));
-                    self.screen = Screen::SourceSelect;
+                    // Stay on the Scan screen and show the error so it isn't a
+                    // silent flash back to source select.
+                    self.scan_error = Some(msg);
                     self.scan_rx = None;
                 }
                 Err(e) => {
-                    self.status = Some(format!("scan task panicked: {e}"));
-                    self.screen = Screen::SourceSelect;
+                    self.scan_error = Some(format!("scan task panicked: {e}"));
                     self.scan_rx = None;
                 }
             }
@@ -403,10 +408,13 @@ impl App {
                 self.meta_done = done;
                 self.meta_total = total;
             }
-            EngineEvent::PlanReady { copies, skips, errors } => {
-                self.scan_status = format!(
-                    "plan ready: {copies} copies, {skips} skips, {errors} errors"
-                );
+            EngineEvent::PlanReady {
+                copies,
+                skips,
+                errors,
+            } => {
+                self.scan_status =
+                    format!("plan ready: {copies} copies, {skips} skips, {errors} errors");
             }
             EngineEvent::Warning { message, .. } => {
                 self.status = Some(format!("warn: {message}"));
@@ -423,7 +431,11 @@ impl App {
             EngineEvent::CopyStarted { file } => {
                 self.start_slot(file.source_rel_path, file.source_size);
             }
-            EngineEvent::CopyProgress { rel_path, bytes_done, bytes_total } => {
+            EngineEvent::CopyProgress {
+                rel_path,
+                bytes_done,
+                bytes_total,
+            } => {
                 self.update_slot(&rel_path, bytes_done, bytes_total);
             }
             EngineEvent::CopyComplete { file, outcome } => {
@@ -454,7 +466,11 @@ impl App {
                     }
                 }
             }
-            EngineEvent::SyncSummary { copied, skipped, failed } => {
+            EngineEvent::SyncSummary {
+                copied,
+                skipped,
+                failed,
+            } => {
                 self.summary_copied = copied;
                 self.summary_skipped = skipped;
                 self.summary_failed = failed;
@@ -587,8 +603,11 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.mounts = detect_mounts();
-                self.sources_state
-                    .select(if self.mounts.is_empty() { None } else { Some(0) });
+                self.sources_state.select(if self.mounts.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
                 self.status = Some("rescanned mounts".into());
             }
             KeyCode::Char('m') | KeyCode::Tab => {
@@ -596,14 +615,12 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') if !self.mounts.is_empty() => {
                 let i = self.sources_state.selected().unwrap_or(0);
-                self.sources_state
-                    .select(Some((i + 1) % self.mounts.len()));
+                self.sources_state.select(Some((i + 1) % self.mounts.len()));
             }
             KeyCode::Up | KeyCode::Char('k') if !self.mounts.is_empty() => {
                 let i = self.sources_state.selected().unwrap_or(0);
-                self.sources_state.select(Some(
-                    if i == 0 { self.mounts.len() - 1 } else { i - 1 },
-                ));
+                self.sources_state
+                    .select(Some(if i == 0 { self.mounts.len() - 1 } else { i - 1 }));
             }
             KeyCode::Enter => {
                 if let Some(i) = self.sources_state.selected() {
@@ -611,7 +628,8 @@ impl App {
                         self.choose_source(m.path);
                     }
                 }
-            }            _ => {}
+            }
+            _ => {}
         }
     }
 
@@ -680,9 +698,7 @@ impl App {
             KeyCode::Esc => {
                 // Back out without applying. If we got here because roots
                 // are missing, return to SourceSelect; otherwise to Confirm.
-                if self.cfg.paths.images_root.is_none()
-                    || self.cfg.paths.videos_root.is_none()
-                {
+                if self.cfg.paths.images_root.is_none() || self.cfg.paths.videos_root.is_none() {
                     self.screen = Screen::SourceSelect;
                 } else {
                     self.screen = Screen::Confirm;
@@ -733,16 +749,16 @@ impl App {
             return;
         }
         // Validate templates by parsing.
-        if let Err(e) = imagesync_core::template::PathTemplate::parse(
-            self.dest_images_template.trim(),
-        ) {
+        if let Err(e) =
+            imagesync_core::template::PathTemplate::parse(self.dest_images_template.trim())
+        {
             self.status = Some(format!("images template invalid: {e}"));
             self.dest_field = DestField::ImagesTemplate;
             return;
         }
-        if let Err(e) = imagesync_core::template::PathTemplate::parse(
-            self.dest_videos_template.trim(),
-        ) {
+        if let Err(e) =
+            imagesync_core::template::PathTemplate::parse(self.dest_videos_template.trim())
+        {
             self.status = Some(format!("videos template invalid: {e}"));
             self.dest_field = DestField::VideosTemplate;
             return;
@@ -777,8 +793,7 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 match self.cfg.save(&self.cfg_path) {
                     Ok(()) => {
-                        self.status =
-                            Some(format!("saved config to {}", self.cfg_path.display()));
+                        self.status = Some(format!("saved config to {}", self.cfg_path.display()));
                         // Update on-disk snapshot so we don't re-prompt.
                         self.raw_mode_disk = self.cfg.filters.raw_mode;
                     }
@@ -813,11 +828,14 @@ impl App {
     }
 
     fn on_key_scan(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        // Any key dismisses a failed scan; otherwise Esc/q cancels an
+        // in-progress one. Both return to source select.
+        if self.scan_error.is_some() || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             if let Some(h) = self.scan_handle.take() {
                 h.abort();
             }
             self.scan_rx = None;
+            self.scan_error = None;
             self.screen = Screen::SourceSelect;
         }
     }
@@ -922,7 +940,9 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn start_scan(&mut self) {
-        let Some(src_path) = self.chosen_source.clone() else { return };
+        let Some(src_path) = self.chosen_source.clone() else {
+            return;
+        };
         let label = self
             .chosen_label
             .clone()
@@ -939,16 +959,14 @@ impl App {
             }
         };
         let registry = self.registry.clone();
-        let source: Arc<dyn MediaSource> = FilesystemSource::new(
-            src_path.to_string_lossy().to_string(),
-            label,
-            src_path,
-        )
-        .into_arc();
+        let source: Arc<dyn MediaSource> =
+            FilesystemSource::new(src_path.to_string_lossy().to_string(), label, src_path)
+                .into_arc();
 
         let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
         self.scan_rx = Some(rx);
         self.scan_status = "starting…".into();
+        self.scan_error = None;
         self.scan_files_total = 0;
         self.meta_done = 0;
         self.meta_total = 0;
@@ -1121,10 +1139,9 @@ impl App {
                 .iter()
                 .map(|m| {
                     let tag = match m.rank {
-                        MountRank::CameraCard => Span::styled(
-                            "[CAMERA]",
-                            Style::default().fg(Color::Green).bold(),
-                        ),
+                        MountRank::CameraCard => {
+                            Span::styled("[CAMERA]", Style::default().fg(Color::Green).bold())
+                        }
                         MountRank::Removable => {
                             Span::styled("[remov.]", Style::default().fg(Color::Cyan))
                         }
@@ -1375,7 +1392,10 @@ impl App {
             Line::from(vec![
                 Span::styled("Raw mode: ", Style::default().fg(Color::Cyan)),
                 Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
-                Span::styled("   (press r to cycle)", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "   (press r to cycle)",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]),
             Line::raw(""),
             Line::from(Span::styled(
@@ -1401,37 +1421,40 @@ impl App {
             ])
             .split(area);
 
+        if let Some(err) = &self.scan_error {
+            let status = Paragraph::new("scan failed")
+                .style(Style::default().fg(Color::Red).bold())
+                .block(Block::default().borders(Borders::ALL).title(" status "));
+            f.render_widget(status, rows[0]);
+
+            let body = Paragraph::new(err.clone())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" error — press any key to go back "),
+                );
+            f.render_widget(body, rows[1].union(rows[2]));
+            return;
+        }
+
         let status = Paragraph::new(self.scan_status.clone())
             .block(Block::default().borders(Borders::ALL).title(" status "));
         f.render_widget(status, rows[0]);
 
-        let pct = if self.meta_total > 0 {
-            (self.meta_done as f64 / self.meta_total as f64).min(1.0)
-        } else {
-            0.0
-        };
-        let label = if self.meta_total > 0 {
-            format!("metadata {}/{}", self.meta_done, self.meta_total)
-        } else {
-            "waiting…".to_string()
-        };
+        // The scan phase only lists files and builds the plan — no EXIF here
+        // (capture dates are read later, on the local copies, during sync).
         let gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" reading metadata "),
-            )
+            .block(Block::default().borders(Borders::ALL).title(" planning "))
             .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(pct)
-            .label(label);
+            .ratio(if self.scan_files_total > 0 { 1.0 } else { 0.0 })
+            .label("building plan…");
         f.render_widget(gauge, rows[1]);
 
-        let info = Paragraph::new(format!(
-            "{} files enumerated. ExifTool runs in stay-open mode.",
-            self.scan_files_total
-        ))
-        .style(Style::default().fg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL));
+        let info = Paragraph::new(format!("{} files enumerated.", self.scan_files_total))
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL));
         f.render_widget(info, rows[2]);
     }
 
@@ -1439,8 +1462,7 @@ impl App {
 
     fn render_review(&mut self, f: &mut Frame, area: Rect) {
         let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(4), Constraint::Min(3)])
+            .constraints([Constraint::Length(5), Constraint::Min(3)])
             .split(area);
 
         let plan = match &self.plan {
@@ -1461,24 +1483,26 @@ impl App {
             ]),
             Line::raw(""),
             Line::from(Span::styled(
+                "Destination folders are resolved during import; this is a provisional source-file list.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
                 "Press 's' to copy, 'd' to dry-run, Esc to back out.",
                 Style::default().fg(Color::Yellow),
             )),
         ];
         f.render_widget(
-            Paragraph::new(summary)
-                .block(Block::default().borders(Borders::ALL).title(" plan ")),
+            Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" plan ")),
             rows[0],
         );
 
         let items = build_review_tree(plan);
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" preview ({} new files) ", plan.copies())),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " provisional preview ({} new files) ",
+                plan.copies()
+            )))
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
         f.render_stateful_widget(list, rows[1], &mut self.review_state);
     }
@@ -1509,9 +1533,7 @@ impl App {
 
         // Total progress
         let pct = if self.sync_total_copy > 0 {
-            ((self.sync_done_copy + self.sync_failed) as f64
-                / self.sync_total_copy as f64)
-                .min(1.0)
+            ((self.sync_done_copy + self.sync_failed) as f64 / self.sync_total_copy as f64).min(1.0)
         } else {
             1.0
         };
@@ -1524,11 +1546,13 @@ impl App {
         }
         let total_gauge = Gauge::default()
             .block(
-                Block::default().borders(Borders::ALL).title(if self.dry_run {
-                    " progress (dry run) "
-                } else {
-                    " progress "
-                }),
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(if self.dry_run {
+                        " progress (dry run) "
+                    } else {
+                        " progress "
+                    }),
             )
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(pct)
@@ -1578,8 +1602,7 @@ impl App {
             })
             .collect();
         f.render_widget(
-            Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title(" log ")),
+            Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(" log ")),
             log_area,
         );
     }
@@ -1639,7 +1662,11 @@ fn push_log(buf: &mut Vec<String>, s: String) {
 /// Slot completion percentage scaled to 0..=1000 for ordinal compare
 /// (used to pick the most-done slot to evict when over-subscribed).
 fn pct_x1000(slot: &CopySlot) -> u64 {
-    match slot.bytes_done.saturating_mul(1000).checked_div(slot.bytes_total) {
+    match slot
+        .bytes_done
+        .saturating_mul(1000)
+        .checked_div(slot.bytes_total)
+    {
         Some(v) => v.min(1000),
         None => 0,
     }
@@ -1668,20 +1695,20 @@ fn raw_mode_label(m: RawMode) -> &'static str {
 /// 3 sample filenames per directory. Directories that don't exist on disk
 /// are marked with a leading `+`.
 fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
-    // Group COPY items by parent directory.
-    let mut groups: BTreeMap<PathBuf, Vec<&PlannedFile>> = BTreeMap::new();
+    // Group COPY candidates by their SOURCE directory. The destination date
+    // folder isn't known until copy time (EXIF is read on the local staged
+    // copy), so the preview is organised by where files come from, with
+    // per-group counts and total size.
+    let mut groups: BTreeMap<String, Vec<&PlannedFile>> = BTreeMap::new();
     for it in &plan.items {
         if it.action != PlannedAction::Copy {
             continue;
         }
-        let Some(dest) = it.dest_path.as_ref() else {
-            continue;
+        let dir = match it.source_rel_path.rsplit_once('/') {
+            Some((d, _)) => d.to_string(),
+            None => "(root)".to_string(),
         };
-        let parent = dest
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/"));
-        groups.entry(parent).or_default().push(it);
+        groups.entry(dir).or_default().push(it);
     }
 
     let mut out: Vec<ListItem<'static>> = Vec::new();
@@ -1699,6 +1726,7 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
         let mut img = 0u32;
         let mut vid = 0u32;
         let mut other = 0u32;
+        let mut bytes = 0u64;
         for f in files {
             match f.kind {
                 MediaKindWire::RawImage => raw += 1,
@@ -1706,25 +1734,15 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
                 MediaKindWire::Video => vid += 1,
                 MediaKindWire::Sidecar => other += 1,
             }
+            bytes += f.source_size;
         }
 
-        let is_new = !dir.exists();
-        let marker = if is_new { "+ " } else { "  " };
-        let marker_style = if is_new {
-            Style::default().fg(Color::Green).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let dir_style = if is_new {
-            Style::default().fg(Color::Green).bold()
-        } else {
-            Style::default().fg(Color::Cyan).bold()
-        };
+        let dir_style = Style::default().fg(Color::Cyan).bold();
 
-        // Header: "+ /path/to/dir/   RAW: 12  IMG: 8  VID: 1"
+        // Header: "  DCIM/100MSDCF/   RAW: 12  IMG: 8  VID: 1   (1.2 GiB)"
         let mut spans = vec![
-            Span::styled(marker, marker_style),
-            Span::styled(format!("{}/", dir.display()), dir_style),
+            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{dir}/"), dir_style),
             Span::raw("   "),
         ];
         if raw > 0 {
@@ -1747,38 +1765,23 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
         }
         if other > 0 {
             spans.push(Span::styled(
-                format!("SIDE: {other}"),
+                format!("SIDE: {other}  "),
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        spans.push(Span::styled(
+            format!("({})", human_bytes(bytes)),
+            Style::default().fg(Color::DarkGray),
+        ));
         out.push(ListItem::new(Line::from(spans)));
 
-        // Sample filenames (top 3 by destination filename, alphabetical).
+        // Sample filenames (top 3 by source basename, alphabetical).
         let mut sorted = files.clone();
-        sorted.sort_by(|a, b| {
-            let an = a
-                .dest_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let bn = b
-                .dest_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            an.cmp(&bn)
-        });
+        sorted.sort_by(|a, b| basename_of(&a.source_rel_path).cmp(basename_of(&b.source_rel_path)));
         let total = sorted.len();
         let show = total.min(3);
         for f in &sorted[..show] {
-            let name = f
-                .dest_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "?".into());
+            let name = basename_of(&f.source_rel_path).to_string();
             let kind_tag = match f.kind {
                 MediaKindWire::RawImage => Span::styled("RAW", Style::default().fg(Color::Magenta)),
                 MediaKindWire::Image => Span::styled("IMG", Style::default().fg(Color::Yellow)),
@@ -1808,6 +1811,10 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
     }
 
     out
+}
+
+fn basename_of(rel_path: &str) -> &str {
+    rel_path.rsplit('/').next().unwrap_or(rel_path)
 }
 
 fn human_bytes(b: u64) -> String {
