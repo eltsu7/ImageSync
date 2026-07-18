@@ -1,4 +1,4 @@
-//! Engine event types emitted to frontends.
+//! Frontend-neutral events and operation result types emitted by the engine.
 
 use std::path::PathBuf;
 
@@ -8,6 +8,12 @@ use crate::classify::MediaKind;
 use crate::metadata::DateSource;
 use crate::source::SourceId;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileId {
+    pub source: SourceId,
+    pub rel_path: String,
+}
+
 /// What the engine plans to do with a single file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedFile {
@@ -16,13 +22,22 @@ pub struct PlannedFile {
     pub source_size: u64,
     pub kind: MediaKindWire,
     pub action: PlannedAction,
-    /// Absolute destination path (only present when `action == Copy`).
+    /// Absolute destination path once metadata and routing have been resolved.
     pub dest_path: Option<PathBuf>,
     /// Resolved capture datetime. May be a fallback.
     pub datetime: Option<chrono::NaiveDateTime>,
     pub date_source: Option<DateSourceWire>,
     /// Human-readable reason (skip / error explanation).
     pub reason: Option<String>,
+}
+
+impl PlannedFile {
+    pub fn id(&self) -> FileId {
+        FileId {
+            source: self.source.clone(),
+            rel_path: self.source_rel_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +92,64 @@ impl From<DateSource> for DateSourceWire {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedProfile {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSummary {
+    pub copies: u64,
+    pub skips: u64,
+    pub errors: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSummary {
+    pub total: u64,
+    pub copied: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub cancelled: bool,
+}
+
+impl SyncSummary {
+    pub fn completed(&self) -> u64 {
+        self.copied + self.skipped + self.failed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePhase {
+    Copying,
+    Verifying,
+    ReadingMetadata,
+    ResolvingDestination,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningKind {
+    ExifToolUnavailable,
+    MetadataFallback,
+    Template,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationErrorKind {
+    Cancelled,
+    Configuration,
+    Destination,
+    Source,
+    ExifTool,
+    Io,
+    Internal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineEvent {
@@ -92,45 +165,58 @@ pub enum EngineEvent {
         source: SourceId,
         files: u64,
     },
+    ProfileDetected {
+        profile: DetectedProfile,
+    },
     MetadataProgress {
         done: u64,
         total: u64,
     },
     PlanReady {
-        copies: u64,
-        skips: u64,
-        errors: u64,
+        summary: PlanSummary,
     },
-    CopyStarted {
+    ExecutionStarted {
+        total_files: u64,
+        total_bytes: u64,
+        dry_run: bool,
+    },
+    FileStarted {
         file: PlannedFile,
     },
-    CopyProgress {
-        rel_path: String,
+    FilePhaseChanged {
+        file: FileId,
+        phase: FilePhase,
+    },
+    FileProgress {
+        file: FileId,
         bytes_done: u64,
         bytes_total: u64,
     },
-    CopyComplete {
+    FileFinished {
         file: PlannedFile,
-        outcome: CopyOutcome,
+        outcome: FileOutcome,
     },
-    SyncSummary {
-        copied: u64,
-        skipped: u64,
-        failed: u64,
+    ExecutionProgress {
+        summary: SyncSummary,
+    },
+    ExecutionFinished {
+        summary: SyncSummary,
     },
     Warning {
+        kind: WarningKind,
         message: String,
-        rel_path: Option<String>,
+        file: Option<FileId>,
     },
     Error {
+        kind: OperationErrorKind,
         message: String,
-        rel_path: Option<String>,
+        file: Option<FileId>,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CopyOutcome {
+pub enum FileOutcome {
     Copied { bytes: u64 },
     Skipped { reason: String },
     Failed { error: String },

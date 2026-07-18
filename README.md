@@ -4,14 +4,14 @@ A cross-platform TUI tool that copies photos and videos from a camera or SD card
 
 **Status:** early development (v0.1 in progress).
 
-## Features (planned for v0.1)
+## Current capabilities
 
-- Copy images and videos to separate destination roots.
-- Configurable date-based path template (default `{yyyy}/{yyyy}-{mm}-{dd}`).
-- Filter RAW vs non-RAW (`all` / `raw_only` / `non_raw_only`).
-- Skip files that already exist at destination (size-based dedupe).
-- Pluggable per-camera profiles (TOML, no code changes needed).
-- Sony α (a7 IV and similar) supported in v0.1 via Mass Storage mode.
+- Interactive TUI and `scan` / `sync` CLI commands for mounted cameras, SD cards, or directories.
+- RAW, image, video, and sidecar filtering; configurable image/video roots and date templates.
+- Provisional fast scan, then staged copy → local metadata read → final placement.
+- Destination pre-skip and per-folder conflict detection; optional xxh3 copy verification.
+- Per-file progress, explicit cancellation with staging cleanup, and filesystem locks per destination root.
+- Configurable TOML camera profiles; Sony Mass Storage sources are supported.
 
 ## Requirements
 

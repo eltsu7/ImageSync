@@ -7,9 +7,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use imagesync_core::config::{AppConfig, RawMode};
-use imagesync_core::events::{CopyOutcome, EngineEvent, PlannedAction};
+use imagesync_core::events::{EngineEvent, FileOutcome, PlannedAction};
 use imagesync_core::source::{FilesystemSource, MediaSource};
-use imagesync_core::{Engine, EngineConfig, ProfileRegistry};
+use imagesync_core::{Engine, EngineConfig, Operation, ProfileRegistry};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing_subscriber::EnvFilter;
 
@@ -31,7 +31,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Launch the interactive TUI (default when no subcommand given).
-    Tui,
+    Tui(TuiArgs),
     /// Scan a source and print the planned actions without copying anything.
     Scan(ScanArgs),
     /// Sync (copy) files from source to configured destinations.
@@ -42,6 +42,13 @@ enum Command {
     Sources,
     /// Print the resolved config (after applying any flags) and exit.
     Config,
+}
+
+#[derive(Parser, Debug, Default)]
+struct TuiArgs {
+    /// Source path to preselect before opening the TUI.
+    #[arg(long)]
+    source: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -126,13 +133,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cli = cli;
 
-    let cmd = cli.command.take().unwrap_or(Command::Tui);
+    let cmd = cli
+        .command
+        .take()
+        .unwrap_or_else(|| Command::Tui(TuiArgs::default()));
     match cmd {
-        Command::Tui => run_tui().await,
+        Command::Tui(args) => run_tui(cli.config.clone(), args).await,
         Command::Scan(args) => run_scan_or_sync(&cli, args.common, true, false).await,
-        Command::Sync(args) => {
-            run_scan_or_sync(&cli, args.common, false, args.dry_run).await
-        }
+        Command::Sync(args) => run_scan_or_sync(&cli, args.common, false, args.dry_run).await,
         Command::Profiles => run_profiles(),
         Command::Sources => run_sources(),
         Command::Config => run_config(&cli),
@@ -152,13 +160,19 @@ fn init_tracing() {
 }
 
 #[cfg(feature = "tui")]
-async fn run_tui() -> Result<()> {
-    imagesync_tui::run().await
+async fn run_tui(config_path: Option<PathBuf>, args: TuiArgs) -> Result<()> {
+    imagesync_tui::run(imagesync_tui::RunOptions {
+        config_path,
+        source: args.source,
+    })
+    .await
 }
 
 #[cfg(not(feature = "tui"))]
-async fn run_tui() -> Result<()> {
-    anyhow::bail!("imagesync was built without the `tui` feature; use `imagesync scan` or `imagesync sync`")
+async fn run_tui(_config_path: Option<PathBuf>, _args: TuiArgs) -> Result<()> {
+    anyhow::bail!(
+        "imagesync was built without the `tui` feature; use `imagesync scan` or `imagesync sync`"
+    )
 }
 
 fn load_app_config(cli: &Cli) -> Result<(AppConfig, PathBuf)> {
@@ -222,8 +236,9 @@ async fn run_scan_or_sync(
     let (app_cfg, _path) = load_app_config(cli)?;
     let app_cfg = apply_overrides(app_cfg, &opts);
 
-    let engine_cfg = EngineConfig::try_from_app(&app_cfg)
-        .context("incomplete configuration (set images_root and videos_root via flags or config file)")?;
+    let engine_cfg = EngineConfig::try_from_app(&app_cfg).context(
+        "incomplete configuration (set images_root and videos_root via flags or config file)",
+    )?;
 
     let registry = ProfileRegistry::with_builtins()?;
 
@@ -238,11 +253,8 @@ async fn run_scan_or_sync(
     .into_arc();
 
     let engine = Engine::new(engine_cfg, registry);
-    let (plan_handle, events) = engine.scan_and_plan(source.clone());
-
-    // Consume events live; the plan handle finishes when the work does.
-    drain_to_stderr(events).await;
-    let plan = plan_handle.await.map_err(|e| anyhow::anyhow!("scan task: {e}"))??;
+    let scan_result = await_operation(engine.scan_and_plan(source.clone()), "scan").await?;
+    let plan = scan_result.plan;
 
     println!();
     println!("=== Plan ===");
@@ -302,40 +314,109 @@ async fn run_scan_or_sync(
             "Executing"
         }
     );
-    let exec = engine.execute(
-        plan,
-        source,
-        imagesync_core::engine::ExecuteOptions {
-            dry_run: effective_dry,
-        },
-    );
-    drain_to_stderr(exec).await;
-
+    let summary = await_operation(
+        engine.execute(
+            plan,
+            source,
+            imagesync_core::engine::ExecuteOptions {
+                dry_run: effective_dry,
+            },
+        ),
+        "sync",
+    )
+    .await?;
+    if summary.cancelled {
+        anyhow::bail!("sync was cancelled");
+    }
     Ok(())
 }
 
-async fn drain_to_stderr(events: ReceiverStream<EngineEvent>) {
-    let mut events = events;
+async fn await_operation<T>(operation: Operation<T>, label: &str) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let Operation {
+        events,
+        mut completion,
+        cancellation,
+    } = operation;
+    let drain = tokio::spawn(drain_to_stderr(events));
+
+    tokio::select! {
+        biased;
+
+        result = &mut completion => {
+            drain.await.context("event consumer task panicked")?;
+            result
+                .map_err(|error| anyhow::anyhow!("{label} task: {error}"))?
+                .with_context(|| format!("{label} failed"))
+        }
+        interrupt = tokio::signal::ctrl_c() => {
+            interrupt.context("installing Ctrl-C handler")?;
+            cancellation.cancel();
+            let completion_result = completion.await;
+            drain.await.context("event consumer task panicked")?;
+            if let Err(error) = completion_result {
+                anyhow::bail!("{label} task panicked while cancelling: {error}");
+            }
+            anyhow::bail!("{label} interrupted after cleanup");
+        }
+    }
+}
+
+async fn drain_to_stderr(mut events: ReceiverStream<EngineEvent>) {
     while let Some(ev) = events.next().await {
         match ev {
             EngineEvent::ScanStarted { display_name, .. } => {
                 eprintln!("scanning: {display_name}");
             }
+            EngineEvent::ScanProgress { files_seen, .. } if files_seen % 200 == 0 => {
+                eprintln!("  scanned: {files_seen} files");
+            }
+            EngineEvent::ScanProgress { .. } => {}
             EngineEvent::ScanComplete { files, .. } => {
                 eprintln!("  {files} files enumerated");
+            }
+            EngineEvent::ProfileDetected { profile } => {
+                eprintln!("  profile: {} ({})", profile.display_name, profile.id);
             }
             EngineEvent::MetadataProgress { done, total } if done == total || done % 200 == 0 => {
                 eprintln!("  metadata: {done}/{total}");
             }
-            EngineEvent::PlanReady {
-                copies,
-                skips,
-                errors,
-            } => {
-                eprintln!("  planned: {copies} copies, {skips} skips, {errors} errors");
+            EngineEvent::MetadataProgress { .. } => {}
+            EngineEvent::PlanReady { summary } => {
+                eprintln!(
+                    "  planned: {} copies, {} skips, {} errors",
+                    summary.copies, summary.skips, summary.errors
+                );
             }
-            EngineEvent::CopyComplete { file, outcome } => match outcome {
-                CopyOutcome::Copied { bytes } => {
+            EngineEvent::ExecutionStarted {
+                total_files,
+                total_bytes,
+                dry_run,
+            } => {
+                eprintln!(
+                    "  {} {} files ({} bytes)",
+                    if dry_run { "dry-running" } else { "executing" },
+                    total_files,
+                    total_bytes
+                );
+            }
+            EngineEvent::FileStarted { file } => {
+                eprintln!("  starting {}", file.source_rel_path);
+            }
+            EngineEvent::FilePhaseChanged { file, phase } => {
+                eprintln!("  {}: {phase:?}", file.rel_path);
+            }
+            EngineEvent::FileProgress {
+                file,
+                bytes_done,
+                bytes_total,
+            } => {
+                eprintln!("  copying {}: {bytes_done}/{bytes_total}", file.rel_path);
+            }
+            EngineEvent::FileFinished { file, outcome } => match outcome {
+                FileOutcome::Copied { bytes } => {
                     eprintln!(
                         "  copied {} ({} bytes) -> {}",
                         file.source_rel_path,
@@ -346,27 +427,54 @@ async fn drain_to_stderr(events: ReceiverStream<EngineEvent>) {
                             .unwrap_or_default()
                     );
                 }
-                CopyOutcome::Skipped { reason } => {
+                FileOutcome::Skipped { reason } => {
                     eprintln!("  skip {} ({reason})", file.source_rel_path);
                 }
-                CopyOutcome::Failed { error } => {
+                FileOutcome::Failed { error } => {
                     eprintln!("  FAIL {} ({error})", file.source_rel_path);
                 }
             },
-            EngineEvent::SyncSummary {
-                copied,
-                skipped,
-                failed,
+            EngineEvent::ExecutionProgress { summary } => {
+                eprintln!(
+                    "  progress: {}/{} (copied={} skipped={} failed={})",
+                    summary.completed(),
+                    summary.total,
+                    summary.copied,
+                    summary.skipped,
+                    summary.failed
+                );
+            }
+            EngineEvent::ExecutionFinished { summary } => {
+                eprintln!(
+                    "\nsummary: copied={} skipped={} failed={}{}",
+                    summary.copied,
+                    summary.skipped,
+                    summary.failed,
+                    if summary.cancelled { " cancelled" } else { "" }
+                );
+            }
+            EngineEvent::Warning {
+                kind,
+                message,
+                file,
             } => {
-                eprintln!("\nsummary: copied={copied} skipped={skipped} failed={failed}");
+                let file = file
+                    .as_ref()
+                    .map(|file| format!(" ({})", file.rel_path))
+                    .unwrap_or_default();
+                eprintln!("warn [{kind:?}]{file}: {message}");
             }
-            EngineEvent::Warning { message, .. } => {
-                eprintln!("warn: {message}");
+            EngineEvent::Error {
+                kind,
+                message,
+                file,
+            } => {
+                let file = file
+                    .as_ref()
+                    .map(|file| format!(" ({})", file.rel_path))
+                    .unwrap_or_default();
+                eprintln!("error [{kind:?}]{file}: {message}");
             }
-            EngineEvent::Error { message, .. } => {
-                eprintln!("error: {message}");
-            }
-            _ => {}
         }
     }
 }

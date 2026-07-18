@@ -46,6 +46,12 @@ pub enum Error {
     #[error("another ImageSync import is already using destination root: {path}")]
     DestinationLocked { path: PathBuf },
 
+    #[error("operation cancelled")]
+    Cancelled,
+
+    #[error("internal error: {0}")]
+    Internal(String),
+
     #[error("toml parse error: {0}")]
     TomlDe(#[from] toml::de::Error),
 

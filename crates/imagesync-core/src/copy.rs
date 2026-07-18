@@ -32,14 +32,20 @@ use crate::error::{Error, Result};
 const COPY_BUF_SIZE: usize = 1024 * 1024; // 1 MiB
 const PROGRESS_BYTES_INTERVAL: u64 = 4 * 1024 * 1024; // emit every ~4 MiB
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyEvent {
+    Progress { bytes_done: u64, bytes_total: u64 },
+    Verifying,
+}
+
 /// Copy `src` to `dest` atomically:
 /// 1. Create dest's parent dir.
 /// 2. Stream copy into `<dest>.imagesync-tmp-<rand>`.
 /// 3. Rename to `dest`.
 ///
-/// Returns total bytes copied. Calls `progress(bytes_done, bytes_total)`
-/// every ~4 MiB and at completion. The callback runs on a blocking
-/// worker thread; it must not block on tokio primitives.
+/// Returns total bytes copied. Calls `progress` every ~4 MiB, when verification
+/// begins, and at completion. The callback runs on a blocking worker thread; it
+/// must not block on Tokio primitives.
 pub async fn copy_atomic<F>(
     src: &Path,
     dest: &Path,
@@ -48,7 +54,7 @@ pub async fn copy_atomic<F>(
     progress: F,
 ) -> Result<u64>
 where
-    F: FnMut(u64, u64) + Send + 'static,
+    F: FnMut(CopyEvent) + Send + 'static,
 {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
@@ -61,11 +67,11 @@ where
     let verify = verify.clone();
 
     // The whole copy happens in one blocking task.
-    tokio::task::spawn_blocking(move || copy_blocking(&src, &dest, &tmp, bytes_total, &verify, progress))
-        .await
-        .map_err(|e| {
-            Error::IoBare(std::io::Error::other(format!("copy task panicked: {e}")))
-        })?
+    tokio::task::spawn_blocking(move || {
+        copy_blocking(&src, &dest, &tmp, bytes_total, &verify, progress)
+    })
+    .await
+    .map_err(|e| Error::IoBare(std::io::Error::other(format!("copy task panicked: {e}"))))?
 }
 
 fn copy_blocking<F>(
@@ -77,7 +83,7 @@ fn copy_blocking<F>(
     mut progress: F,
 ) -> Result<u64>
 where
-    F: FnMut(u64, u64) + Send,
+    F: FnMut(CopyEvent) + Send,
 {
     let mut reader = File::open(src).map_err(|e| Error::io(src, e))?;
     let mut writer = std::fs::OpenOptions::new()
@@ -103,13 +109,14 @@ where
         if let Some(h) = hasher_src.as_mut() {
             h.update(&buf[..n]);
         }
-        writer
-            .write_all(&buf[..n])
-            .map_err(|e| Error::io(tmp, e))?;
+        writer.write_all(&buf[..n]).map_err(|e| Error::io(tmp, e))?;
         total += n as u64;
         if total - last_progress_total >= PROGRESS_BYTES_INTERVAL {
             last_progress_total = total;
-            progress(total, bytes_total);
+            progress(CopyEvent::Progress {
+                bytes_done: total,
+                bytes_total,
+            });
         }
     }
     writer.flush().map_err(|e| Error::io(tmp, e))?;
@@ -117,6 +124,7 @@ where
     drop(reader);
 
     if let Some(h) = hasher_src {
+        progress(CopyEvent::Verifying);
         let src_hash = h.digest();
         let dst_hash = hash_file_xxh3_blocking(tmp)?;
         if src_hash != dst_hash {
@@ -134,7 +142,10 @@ where
     std::fs::rename(tmp, dest).map_err(|e| Error::io(dest, e))?;
 
     // Final progress event so the gauge ends at 100%.
-    progress(total, bytes_total);
+    progress(CopyEvent::Progress {
+        bytes_done: total,
+        bytes_total,
+    });
     Ok(total)
 }
 
@@ -211,9 +222,7 @@ fn temp_path_for(dest: &Path) -> PathBuf {
     let pid = std::process::id();
     let name = format!(
         "{}.imagesync-tmp-{pid}-{nanos:08x}",
-        dest.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("file")
     );
     match dest.parent() {
         Some(p) => p.join(name),
@@ -232,7 +241,7 @@ mod tests {
         let src = dir.path().join("a.bin");
         std::fs::write(&src, b"hello world").unwrap();
         let dest = dir.path().join("nested/dir/a.bin");
-        let bytes = copy_atomic(&src, &dest, 11, &VerifyConfig::default(), |_, _| {})
+        let bytes = copy_atomic(&src, &dest, 11, &VerifyConfig::default(), |_| {})
             .await
             .unwrap();
         assert_eq!(bytes, 11);
@@ -241,6 +250,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_round_trips() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         let dir = tempdir().unwrap();
         let src = dir.path().join("a.bin");
         let payload: Vec<u8> = (0u8..255).cycle().take(2_000_000).collect();
@@ -250,36 +261,48 @@ mod tests {
             enabled: true,
             algorithm: crate::config::VerifyAlgorithm::Xxh3,
         };
-        let bytes = copy_atomic(&src, &dest, payload.len() as u64, &v, |_, _| {})
-            .await
-            .unwrap();
+        let saw_verifying = Arc::new(AtomicBool::new(false));
+        let callback_flag = saw_verifying.clone();
+        let bytes = copy_atomic(&src, &dest, payload.len() as u64, &v, move |event| {
+            if event == CopyEvent::Verifying {
+                callback_flag.store(true, Ordering::Relaxed);
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        assert!(saw_verifying.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
     async fn progress_callback_invoked() {
-        use std::sync::{Arc, Mutex};
+        use std::sync::mpsc;
         let dir = tempdir().unwrap();
         let src = dir.path().join("big.bin");
         // ~10 MiB of data so we cross a few PROGRESS_BYTES_INTERVAL boundaries.
         let payload = vec![0u8; 10 * 1024 * 1024];
         std::fs::write(&src, &payload).unwrap();
         let dest = dir.path().join("big.bin.copy");
-        let calls: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
-        let calls2 = calls.clone();
+        let (tx, rx) = mpsc::channel();
         copy_atomic(
             &src,
             &dest,
             payload.len() as u64,
             &VerifyConfig::default(),
-            move |done, total| {
-                calls2.lock().unwrap().push((done, total));
+            move |event| {
+                if let CopyEvent::Progress {
+                    bytes_done,
+                    bytes_total,
+                } = event
+                {
+                    let _ = tx.send((bytes_done, bytes_total));
+                }
             },
         )
         .await
         .unwrap();
-        let calls = calls.lock().unwrap();
+        let calls: Vec<_> = rx.try_iter().collect();
         assert!(!calls.is_empty(), "progress should have been reported");
         // Final callback should equal total size.
         assert_eq!(calls.last().unwrap().0, payload.len() as u64);

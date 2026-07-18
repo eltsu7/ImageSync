@@ -2,16 +2,19 @@
 
 use fs2::FileExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::classify::MediaKind;
 use crate::config::EngineConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::events::{
-    CopyOutcome, DateSourceWire, EngineEvent, MediaKindWire, PlannedAction, PlannedFile,
+    DateSourceWire, DetectedProfile, EngineEvent, FileId, FileOutcome, FilePhase, MediaKindWire,
+    OperationErrorKind, PlanSummary, PlannedAction, PlannedFile, SyncSummary, WarningKind,
 };
 use crate::exiftool::{ExifTool, FileMetadata};
 use crate::metadata::{self, ResolvedMetadata};
@@ -23,6 +26,77 @@ use crate::source::{BackendHandle, MediaSource, SourceFile, SourceId};
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
     pub dry_run: bool,
+}
+/// A cooperative cancellation signal shared by an operation and its caller.
+#[derive(Debug, Clone)]
+pub struct CancellationHandle {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationHandle {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Request cancellation. The operation completes after its current safe
+    /// boundary and any required staging cleanup.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// A running engine operation. Completion is authoritative; event-stream
+/// closure alone never indicates whether the operation succeeded.
+pub struct Operation<T> {
+    pub events: ReceiverStream<EngineEvent>,
+    pub completion: JoinHandle<Result<T>>,
+    pub cancellation: CancellationHandle,
+}
+
+/// The scan output used to begin execution.
+#[derive(Debug, Clone)]
+pub struct ScanResult {
+    pub plan: SyncPlan,
+    pub profile: DetectedProfile,
+}
+
+fn operation_error_kind(error: &Error) -> OperationErrorKind {
+    match error {
+        Error::Cancelled => OperationErrorKind::Cancelled,
+        Error::Config(_)
+        | Error::Template { .. }
+        | Error::Profile(_)
+        | Error::TomlDe(_)
+        | Error::TomlSer(_) => OperationErrorKind::Configuration,
+        Error::DestRootMissing { .. }
+        | Error::DestRootNotDir { .. }
+        | Error::DestinationLocked { .. } => OperationErrorKind::Destination,
+        Error::Source(_) => OperationErrorKind::Source,
+        Error::ExiftoolMissing | Error::Exiftool(_) | Error::Metadata { .. } => {
+            OperationErrorKind::ExifTool
+        }
+        Error::Io { .. } | Error::IoBare(_) => OperationErrorKind::Io,
+        Error::Json(_) | Error::Internal(_) => OperationErrorKind::Internal,
+    }
+}
+
+async fn emit_event(
+    tx: &mpsc::Sender<EngineEvent>,
+    cancellation: &CancellationHandle,
+    event: EngineEvent,
+) -> bool {
+    if tx.send(event).await.is_err() {
+        cancellation.cancel();
+        false
+    } else {
+        true
+    }
 }
 
 pub struct Engine {
@@ -43,51 +117,89 @@ impl Engine {
         &self.registry
     }
 
-    /// Spawn a scan + plan task. Returns a join handle that resolves to the
-    /// final [`SyncPlan`] together with a stream of progress events. The
-    /// caller MUST consume the stream concurrently with awaiting the join
-    /// handle, otherwise the channel buffer fills up and progress events
-    /// look like a single end-of-run flush.
-    pub fn scan_and_plan(
-        &self,
-        source: Arc<dyn MediaSource>,
-    ) -> (
-        tokio::task::JoinHandle<Result<SyncPlan>>,
-        ReceiverStream<EngineEvent>,
-    ) {
+    /// Spawn a scan + plan operation. Consume events concurrently with awaiting
+    /// [`Operation::completion`] so event backpressure cannot delay completion.
+    pub fn scan_and_plan(&self, source: Arc<dyn MediaSource>) -> Operation<ScanResult> {
         let (tx, rx) = mpsc::channel::<EngineEvent>(256);
         let cfg = self.config.clone();
         let registry = self.registry.clone();
+        let cancellation = CancellationHandle::new();
+        let task_cancellation = cancellation.clone();
         let tx2 = tx.clone();
-        let handle = tokio::spawn(async move {
-            let res = run_scan_and_plan(cfg, registry, source, tx2.clone()).await;
-            if let Err(e) = &res {
-                let _ = tx2
-                    .send(EngineEvent::Error {
-                        message: format!("{e}"),
-                        rel_path: None,
-                    })
-                    .await;
+        let completion = tokio::spawn(async move {
+            let result = run_scan_and_plan(
+                cfg,
+                registry,
+                source,
+                tx2.clone(),
+                task_cancellation.clone(),
+            )
+            .await;
+            if let Err(error) = &result {
+                emit_event(
+                    &tx2,
+                    &task_cancellation,
+                    EngineEvent::Error {
+                        kind: operation_error_kind(error),
+                        message: error.to_string(),
+                        file: None,
+                    },
+                )
+                .await;
             }
-            res
+            result
         });
         drop(tx);
-        (handle, ReceiverStream::new(rx))
+        Operation {
+            events: ReceiverStream::new(rx),
+            completion,
+            cancellation,
+        }
     }
 
-    /// Execute a plan, emitting events and returning a summary at the end.
+    /// Execute a plan and return an operation whose completion contains the
+    /// authoritative final summary.
     pub fn execute(
         &self,
         plan: SyncPlan,
         source: Arc<dyn MediaSource>,
         opts: ExecuteOptions,
-    ) -> ReceiverStream<EngineEvent> {
+    ) -> Operation<SyncSummary> {
         let (tx, rx) = mpsc::channel::<EngineEvent>(256);
         let cfg = self.config.clone();
-        tokio::spawn(async move {
-            let _ = run_execute(cfg, plan, source, opts, tx).await;
+        let cancellation = CancellationHandle::new();
+        let task_cancellation = cancellation.clone();
+        let tx2 = tx.clone();
+        let completion = tokio::spawn(async move {
+            let result = run_execute(
+                cfg,
+                plan,
+                source,
+                opts,
+                tx2.clone(),
+                task_cancellation.clone(),
+            )
+            .await;
+            if let Err(error) = &result {
+                emit_event(
+                    &tx2,
+                    &task_cancellation,
+                    EngineEvent::Error {
+                        kind: operation_error_kind(error),
+                        message: error.to_string(),
+                        file: None,
+                    },
+                )
+                .await;
+            }
+            result
         });
-        ReceiverStream::new(rx)
+        drop(tx);
+        Operation {
+            events: ReceiverStream::new(rx),
+            completion,
+            cancellation,
+        }
     }
 }
 
@@ -104,7 +216,12 @@ async fn run_scan_and_plan(
     registry: ProfileRegistry,
     source: Arc<dyn MediaSource>,
     tx: mpsc::Sender<EngineEvent>,
-) -> Result<SyncPlan> {
+    cancellation: CancellationHandle,
+) -> Result<ScanResult> {
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+
     // Pre-flight: refuse to run if the destination roots aren't reachable.
     // This catches the common "drive isn't mounted" footgun where every
     // file would otherwise look new, get copied to an empty mount point,
@@ -112,26 +229,72 @@ async fn run_scan_and_plan(
     // empty directories are accepted (legitimate first-time setup).
     check_dest_root(&cfg.images_root, "images_root")?;
     check_dest_root(&cfg.videos_root, "videos_root")?;
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
 
-    let _ = tx
-        .send(EngineEvent::ScanStarted {
+    if !emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ScanStarted {
             source: source.id().clone(),
             display_name: source.display_name().to_string(),
-        })
-        .await;
+        },
+    )
+    .await
+    {
+        return Err(Error::Cancelled);
+    }
 
-    // Detect profile.
+    // Detect profile before enumeration so frontends can identify the source
+    // while a potentially slow source listing is in flight.
     let profile = registry.detect_for_source(source.root_path());
+    let detected_profile = DetectedProfile {
+        id: profile.id.clone(),
+        display_name: profile.display_name.clone(),
+    };
+    if !emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ProfileDetected {
+            profile: detected_profile.clone(),
+        },
+    )
+    .await
+        || cancellation.is_cancelled()
+    {
+        return Err(Error::Cancelled);
+    }
 
     // Enumerate files.
     let t_list_start = std::time::Instant::now();
     let files = source.list_files().await?;
-    let _ = tx
-        .send(EngineEvent::ScanComplete {
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let file_count = files.len() as u64;
+    if !emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ScanProgress {
             source: source.id().clone(),
-            files: files.len() as u64,
-        })
-        .await;
+            files_seen: file_count,
+        },
+    )
+    .await
+        || !emit_event(
+            &tx,
+            &cancellation,
+            EngineEvent::ScanComplete {
+                source: source.id().clone(),
+                files: file_count,
+            },
+        )
+        .await
+        || cancellation.is_cancelled()
+    {
+        return Err(Error::Cancelled);
+    }
     tracing::debug!(
         count = files.len(),
         elapsed_ms = t_list_start.elapsed().as_millis() as u64,
@@ -143,6 +306,9 @@ async fn run_scan_and_plan(
     let t_index_start = std::time::Instant::now();
     let dest_index =
         plan::DestIndex::build(&[cfg.images_root.as_path(), cfg.videos_root.as_path()]);
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     tracing::debug!(
         indexed = dest_index.len(),
         elapsed_ms = t_index_start.elapsed().as_millis() as u64,
@@ -153,6 +319,9 @@ async fn run_scan_and_plan(
     let t_plan_start = std::time::Instant::now();
     let cheap = plan::cheap_plan(&cfg, profile, source.id(), files, &dest_index);
     let plan = cheap.into_sync_plan(source.id());
+    if cancellation.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     tracing::debug!(
         profile = profile.id,
         units = plan.units.len(),
@@ -160,15 +329,21 @@ async fn run_scan_and_plan(
         "cheap plan built (no exiftool)"
     );
 
-    let _ = tx
-        .send(EngineEvent::PlanReady {
-            copies: plan.copies(),
-            skips: plan.skips(),
-            errors: plan.errors(),
-        })
-        .await;
+    let summary = PlanSummary {
+        copies: plan.copies(),
+        skips: plan.skips(),
+        errors: plan.errors(),
+    };
+    if !emit_event(&tx, &cancellation, EngineEvent::PlanReady { summary }).await
+        || cancellation.is_cancelled()
+    {
+        return Err(Error::Cancelled);
+    }
 
-    Ok(plan)
+    Ok(ScanResult {
+        plan,
+        profile: detected_profile,
+    })
 }
 
 async fn run_execute(
@@ -177,24 +352,81 @@ async fn run_execute(
     source: Arc<dyn MediaSource>,
     opts: ExecuteOptions,
     tx: mpsc::Sender<EngineEvent>,
-) -> Result<()> {
-    if opts.dry_run {
-        return run_execute_dry(cfg, plan, source, tx).await;
+    cancellation: CancellationHandle,
+) -> Result<SyncSummary> {
+    let total = plan.items.len() as u64;
+    let total_bytes = plan
+        .items
+        .iter()
+        .filter(|item| item.action == PlannedAction::Copy)
+        .map(|item| item.source_size)
+        .sum();
+
+    // Plans can be persisted/replayed and roots can be unmounted between scan
+    // and execute. Validate before taking locks so we never create a lock file
+    // under an unintended or missing destination.
+    check_dest_root(&cfg.images_root, "images_root")?;
+    check_dest_root(&cfg.videos_root, "videos_root")?;
+    let _destination_locks = if opts.dry_run {
+        None
+    } else {
+        Some(lock_destination_roots(&cfg.images_root, &cfg.videos_root)?)
+    };
+
+    emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ExecutionStarted {
+            total_files: total,
+            total_bytes,
+            dry_run: opts.dry_run,
+        },
+    )
+    .await;
+
+    if !cancellation.is_cancelled() {
+        for message in &cfg.template_warnings {
+            if !emit_event(
+                &tx,
+                &cancellation,
+                EngineEvent::Warning {
+                    kind: WarningKind::Template,
+                    message: message.clone(),
+                    file: None,
+                },
+            )
+            .await
+            {
+                break;
+            }
+        }
     }
 
-    // Re-check destination roots before any copy. Defensive: scan_and_plan
-    // already checked, but plans can be persisted/replayed and roots can
-    // be unmounted between scan and execute.
-    let _destination_locks = lock_destination_roots(&cfg.images_root, &cfg.videos_root)?;
-    run_execute_staging(cfg, plan, source, tx).await
+    if opts.dry_run {
+        run_execute_dry(cfg, plan, source, tx, cancellation, total).await
+    } else {
+        run_execute_staging(cfg, plan, source, tx, cancellation, total).await
+    }
 }
 
 /// Shared, lock-free counters for the staging executor's worker tasks.
 #[derive(Default)]
 struct Counters {
-    copied: std::sync::atomic::AtomicU64,
-    skipped: std::sync::atomic::AtomicU64,
-    failed: std::sync::atomic::AtomicU64,
+    copied: AtomicU64,
+    skipped: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl Counters {
+    fn summary(&self, total: u64, cancelled: bool) -> SyncSummary {
+        SyncSummary {
+            total,
+            copied: self.copied.load(Ordering::Relaxed),
+            skipped: self.skipped.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            cancelled,
+        }
+    }
 }
 
 /// Real sync via the copy→exif→move pipeline.
@@ -203,77 +435,55 @@ struct Counters {
 /// copy parent + sidecars to a per-root staging dir, read EXIF from the **local**
 /// staged copy, date + dedupe, then `rename` into the final date folder. The USB
 /// is read once, sequentially; the seeky EXIF reads land on local disk.
-/// `CopyComplete` is emitted as soon as each file is placed, so progress streams
-/// smoothly per file instead of jumping per batch.
-///
-/// If the event consumer goes away (the UI aborts the sync), `send` starts
-/// failing; we set `cancel`, stop launching work, and — because this engine task
-/// still runs to completion — sweep the staging area on the way out.
 async fn run_execute_staging(
     cfg: EngineConfig,
     plan: SyncPlan,
     source: Arc<dyn MediaSource>,
     tx: mpsc::Sender<EngineEvent>,
-) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    cancellation: CancellationHandle,
+    total: u64,
+) -> Result<SyncSummary> {
     use tokio::sync::{Mutex, Semaphore};
 
     let counters = Arc::new(Counters::default());
-    let cancel = Arc::new(AtomicBool::new(false));
+
+    // Sweep stale staging before starting, including when cancellation was
+    // already requested.
+    sweep_staging(&cfg.images_root.join(plan::STAGING_DIR_NAME));
+    sweep_staging(&cfg.videos_root.join(plan::STAGING_DIR_NAME));
 
     // Emit already-decided (non-copy) rows up front.
     for item in plan
         .items
         .iter()
-        .filter(|i| i.action != PlannedAction::Copy)
+        .filter(|item| item.action != PlannedAction::Copy)
     {
-        let is_err = item.action == PlannedAction::Error;
-        let outcome = if is_err {
-            CopyOutcome::Failed {
-                error: item
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "planning error".into()),
-            }
-        } else {
-            CopyOutcome::Skipped {
-                reason: item.reason.clone().unwrap_or_else(|| "skipped".into()),
-            }
-        };
-        if tx
-            .send(EngineEvent::CopyComplete {
-                file: item.clone(),
-                outcome,
-            })
-            .await
-            .is_err()
-        {
-            cancel.store(true, Ordering::Relaxed);
+        if cancellation.is_cancelled() {
             break;
         }
-        if is_err {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
-        } else {
-            counters.skipped.fetch_add(1, Ordering::Relaxed);
-        }
+        emit_decided(&tx, item.clone(), &counters, total, &cancellation).await;
     }
 
-    // Sweep any stale staging left by a previous crash or abort.
-    sweep_staging(&cfg.images_root.join(plan::STAGING_DIR_NAME));
-    sweep_staging(&cfg.videos_root.join(plan::STAGING_DIR_NAME));
+    let mut worker_error = None;
 
-    if !cancel.load(Ordering::Relaxed) {
+    if !cancellation.is_cancelled() {
         // One shared exiftool process (local reads). Workers serialize on its
         // internal lock; we fall back to mtime dating if it can't spawn.
         let exif = Arc::new(match ExifTool::spawn().await {
-            Ok(e) => Some(e),
-            Err(e) => {
-                let _ = tx
-                    .send(EngineEvent::Warning {
-                        message: format!("exiftool unavailable, dating by file mtime only: {e}"),
-                        rel_path: None,
-                    })
-                    .await;
+            Ok(exif) => Some(exif),
+            Err(error) => {
+                emit_event(
+                    &tx,
+                    &cancellation,
+                    EngineEvent::Warning {
+                        kind: WarningKind::ExifToolUnavailable,
+                        message: format!(
+                            "exiftool unavailable, dating by file mtime only: {error}"
+                        ),
+                        file: None,
+                    },
+                )
+                .await;
                 None
             }
         });
@@ -286,13 +496,17 @@ async fn run_execute_staging(
         let mut joins = Vec::new();
 
         for unit in plan.units {
-            if cancel.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
                 break;
             }
             let permit = match sem.clone().acquire_owned().await {
-                Ok(p) => p,
+                Ok(permit) => permit,
                 Err(_) => break,
             };
+            if cancellation.is_cancelled() {
+                drop(permit);
+                break;
+            }
             let cfg = cfg.clone();
             let source = source.clone();
             let source_id = source_id.clone();
@@ -300,7 +514,7 @@ async fn run_execute_staging(
             let dedupe = dedupe.clone();
             let tx = tx.clone();
             let counters = counters.clone();
-            let cancel = cancel.clone();
+            let cancellation = cancellation.clone();
             let n = seq.fetch_add(1, Ordering::Relaxed);
             joins.push(tokio::spawn(async move {
                 process_unit(
@@ -313,18 +527,22 @@ async fn run_execute_staging(
                     n,
                     &tx,
                     &counters,
-                    &cancel,
+                    &cancellation,
+                    total,
                 )
                 .await;
                 drop(permit);
             }));
         }
-        for h in joins {
-            let _ = h.await;
+        for join in joins {
+            if let Err(error) = join.await {
+                tracing::error!(%error, "staging worker terminated unexpectedly");
+                worker_error.get_or_insert(error);
+            }
         }
 
-        if let Some(e) = Arc::into_inner(exif).flatten() {
-            let _ = e.shutdown().await;
+        if let Some(exif) = Arc::into_inner(exif).flatten() {
+            let _ = exif.shutdown().await;
         }
 
         let placed = counters.copied.load(Ordering::Relaxed);
@@ -342,37 +560,84 @@ async fn run_execute_staging(
         );
     }
 
-    // Always clean up staging — runs even on abort (the UI just drops the
-    // event stream; this engine task still completes).
+    // Always clean up staging — receiver loss and explicit cancellation both
+    // wait for the workers before this cleanup and final completion result.
     sweep_staging(&cfg.images_root.join(plan::STAGING_DIR_NAME));
     sweep_staging(&cfg.videos_root.join(plan::STAGING_DIR_NAME));
 
-    if !cancel.load(Ordering::Relaxed) {
-        let _ = tx
-            .send(EngineEvent::SyncSummary {
-                copied: counters.copied.load(Ordering::Relaxed),
-                skipped: counters.skipped.load(Ordering::Relaxed),
-                failed: counters.failed.load(Ordering::Relaxed),
-            })
-            .await;
+    if let Some(error) = worker_error {
+        return Err(Error::Internal(format!(
+            "staging worker terminated unexpectedly: {error}"
+        )));
     }
-    Ok(())
+
+    let summary = counters.summary(total, cancellation.is_cancelled());
+    emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ExecutionFinished { summary },
+    )
+    .await;
+    Ok(summary)
 }
 
-/// Send a CopyComplete; mark `cancel` if the consumer has gone away.
-async fn send_complete(
+async fn send_file_started(
     tx: &mpsc::Sender<EngineEvent>,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancellation: &CancellationHandle,
     file: PlannedFile,
-    outcome: CopyOutcome,
+) -> bool {
+    emit_event(tx, cancellation, EngineEvent::FileStarted { file }).await
+}
+
+async fn send_phase(
+    tx: &mpsc::Sender<EngineEvent>,
+    cancellation: &CancellationHandle,
+    file: FileId,
+    phase: FilePhase,
+) -> bool {
+    emit_event(
+        tx,
+        cancellation,
+        EngineEvent::FilePhaseChanged { file, phase },
+    )
+    .await
+}
+
+/// Emit a terminal file outcome and the matching authoritative aggregate
+/// progress update. Terminal outcomes are counted even if cancellation arrives
+/// while a worker is completing its current safe unit.
+async fn send_file_finished(
+    tx: &mpsc::Sender<EngineEvent>,
+    cancellation: &CancellationHandle,
+    counters: &Counters,
+    total: u64,
+    file: PlannedFile,
+    outcome: FileOutcome,
 ) {
-    if tx
-        .send(EngineEvent::CopyComplete { file, outcome })
-        .await
-        .is_err()
-    {
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    match &outcome {
+        FileOutcome::Copied { .. } => {
+            counters.copied.fetch_add(1, Ordering::Relaxed);
+        }
+        FileOutcome::Skipped { .. } => {
+            counters.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        FileOutcome::Failed { .. } => {
+            counters.failed.fetch_add(1, Ordering::Relaxed);
+        }
     }
+
+    if !emit_event(
+        tx,
+        cancellation,
+        EngineEvent::FileFinished { file, outcome },
+    )
+    .await
+    {
+        return;
+    }
+
+    let summary = counters.summary(total, cancellation.is_cancelled());
+    emit_event(tx, cancellation, EngineEvent::ExecutionProgress { summary }).await;
 }
 
 /// Handle one unit end-to-end: copy to staging → EXIF the local copy → date +
@@ -388,17 +653,16 @@ async fn process_unit(
     seq: u64,
     tx: &mpsc::Sender<EngineEvent>,
     counters: &Counters,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancellation: &CancellationHandle,
+    total: u64,
 ) {
-    use std::sync::atomic::Ordering;
-
     let root = match unit.parent_kind {
         MediaKind::Video => &cfg.videos_root,
         _ => &cfg.images_root,
     };
     let seq_dir = root.join(plan::STAGING_DIR_NAME).join(seq.to_string());
 
-    // Copy the parent first; a sidecar can't be dated without it.
+    // Copy the parent first; a sidecar cannot be dated without it.
     let parent = match copy_one_to_staging(
         cfg,
         source,
@@ -406,24 +670,34 @@ async fn process_unit(
         unit.parent_kind,
         &seq_dir,
         tx,
-        cancel,
+        counters,
+        total,
+        cancellation,
     )
     .await
     {
-        Some(sf) => sf,
+        Some(staged) => staged,
         None => {
-            if !cancel.load(Ordering::Relaxed) {
-                counters.failed.fetch_add(1, Ordering::Relaxed);
+            if !cancellation.is_cancelled() {
                 for sidecar in &unit.sidecars {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
-                    let reason = "parent copy failed; sidecar not copied".to_string();
-                    send_complete(
+                    let file = provisional_file(source_id, sidecar, MediaKind::Sidecar);
+                    if !send_file_started(tx, cancellation, file.clone()).await {
+                        break;
+                    }
+                    send_file_finished(
                         tx,
-                        cancel,
-                        provisional_file(source_id, sidecar, MediaKind::Sidecar),
-                        CopyOutcome::Failed { error: reason },
+                        cancellation,
+                        counters,
+                        total,
+                        file,
+                        FileOutcome::Failed {
+                            error: "parent copy failed; sidecar not copied".to_string(),
+                        },
                     )
                     .await;
+                    if cancellation.is_cancelled() {
+                        break;
+                    }
                 }
             }
             let _ = tokio::fs::remove_dir_all(&seq_dir).await;
@@ -432,36 +706,75 @@ async fn process_unit(
     };
 
     let mut sidecars = Vec::new();
-    for s in &unit.sidecars {
-        if cancel.load(Ordering::Relaxed) {
+    for sidecar in &unit.sidecars {
+        if cancellation.is_cancelled() {
             break;
         }
-        match copy_one_to_staging(cfg, source, s, MediaKind::Sidecar, &seq_dir, tx, cancel).await {
-            Some(sf) => sidecars.push(sf),
-            None => {
-                if !cancel.load(Ordering::Relaxed) {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+        if let Some(staged) = copy_one_to_staging(
+            cfg,
+            source,
+            sidecar,
+            MediaKind::Sidecar,
+            &seq_dir,
+            tx,
+            counters,
+            total,
+            cancellation,
+        )
+        .await
+        {
+            sidecars.push(staged);
         }
     }
 
-    if cancel.load(Ordering::Relaxed) {
+    if cancellation.is_cancelled() {
         let _ = tokio::fs::remove_dir_all(&seq_dir).await;
         return;
     }
 
     // EXIF the staged parent on local disk (single-file read on the shared
-    // stay-open process; cheap because there's no USB seek).
+    // stay-open process; cheap because there is no USB seek).
+    let parent_id = file_id(source_id, &parent.rel_path);
+    if !send_phase(
+        tx,
+        cancellation,
+        parent_id.clone(),
+        FilePhase::ReadingMetadata,
+    )
+    .await
+    {
+        let _ = tokio::fs::remove_dir_all(&seq_dir).await;
+        return;
+    }
     let meta = match exif {
-        Some(e) => e
+        Some(exif) => match exif
             .read_batch(std::slice::from_ref(&parent.staged_path))
             .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
-            .unwrap_or_default(),
+        {
+            Ok(mut metadata) => metadata.pop().unwrap_or_default(),
+            Err(error) => {
+                emit_event(
+                    tx,
+                    cancellation,
+                    EngineEvent::Warning {
+                        kind: WarningKind::MetadataFallback,
+                        message: format!(
+                            "{}: metadata read failed; using file mtime: {error}",
+                            parent.rel_path
+                        ),
+                        file: Some(parent_id.clone()),
+                    },
+                )
+                .await;
+                FileMetadata::default()
+            }
+        },
         None => FileMetadata::default(),
     };
+    if cancellation.is_cancelled() {
+        let _ = tokio::fs::remove_dir_all(&seq_dir).await;
+        return;
+    }
     let synthetic = SourceFile {
         rel_path: parent.rel_path.clone(),
         size: parent.size,
@@ -472,47 +785,61 @@ async fn process_unit(
 
     match metadata::resolve_one(&synthetic, &meta) {
         None => {
-            place_no_date(source_id, &parent, tx, counters, cancel).await;
-            for s in &sidecars {
-                place_no_date(source_id, s, tx, counters, cancel).await;
+            place_no_date(source_id, &parent, tx, counters, total, cancellation).await;
+            for sidecar in &sidecars {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                place_no_date(source_id, sidecar, tx, counters, total, cancellation).await;
             }
         }
-        Some(rm) => {
-            if rm.source.is_fallback() {
-                let _ = tx
-                    .send(EngineEvent::Warning {
+        Some(metadata) => {
+            if metadata.source.is_fallback() {
+                emit_event(
+                    tx,
+                    cancellation,
+                    EngineEvent::Warning {
+                        kind: WarningKind::MetadataFallback,
                         message: format!(
                             "{}: using {} (no DateTimeOriginal)",
                             parent.rel_path,
-                            rm.source.label()
+                            metadata.source.label()
                         ),
-                        rel_path: Some(parent.rel_path.clone()),
-                    })
-                    .await;
+                        file: Some(parent_id),
+                    },
+                )
+                .await;
             }
-            place_one(
-                cfg,
-                source_id,
-                dedupe,
-                &parent,
-                unit.parent_kind,
-                &rm,
-                tx,
-                counters,
-                cancel,
-            )
-            .await;
-            for s in &sidecars {
+            if !cancellation.is_cancelled() {
                 place_one(
                     cfg,
                     source_id,
                     dedupe,
-                    s,
+                    &parent,
                     unit.parent_kind,
-                    &rm,
+                    &metadata,
                     tx,
                     counters,
-                    cancel,
+                    total,
+                    cancellation,
+                )
+                .await;
+            }
+            for sidecar in &sidecars {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                place_one(
+                    cfg,
+                    source_id,
+                    dedupe,
+                    sidecar,
+                    unit.parent_kind,
+                    &metadata,
+                    tx,
+                    counters,
+                    total,
+                    cancellation,
                 )
                 .await;
             }
@@ -523,89 +850,92 @@ async fn process_unit(
     let _ = tokio::fs::remove_dir_all(&seq_dir).await;
 }
 
-/// Dry run: resolve copy units' dates over USB (the old exiftool path) and
-/// report what *would* happen, writing nothing. Keeps exact destinations for
-/// the `scan` / `--dry-run` previews.
+/// Dry run: resolve copy units' dates over USB and report what would happen,
+/// writing nothing.
 async fn run_execute_dry(
     cfg: EngineConfig,
     plan: SyncPlan,
     source: Arc<dyn MediaSource>,
     tx: mpsc::Sender<EngineEvent>,
-) -> Result<()> {
-    let mut tally = Tally::default();
+    cancellation: CancellationHandle,
+    total: u64,
+) -> Result<SyncSummary> {
+    let counters = Counters::default();
     for item in plan
         .items
         .iter()
-        .filter(|i| i.action != PlannedAction::Copy)
+        .filter(|item| item.action != PlannedAction::Copy)
     {
-        emit_decided(&tx, item.clone(), &mut tally).await;
+        if cancellation.is_cancelled() {
+            break;
+        }
+        emit_decided(&tx, item.clone(), &counters, total, &cancellation).await;
     }
 
-    let dated = resolve_units_over_usb(&cfg, source.as_ref(), &plan.units, &tx).await?;
-    for item in dated.items {
-        match item.action {
-            PlannedAction::Copy => {
-                tally.copied += 1;
-                let _ = tx
-                    .send(EngineEvent::CopyStarted { file: item.clone() })
-                    .await;
-                let bytes = item.source_size;
-                let _ = tx
-                    .send(EngineEvent::CopyComplete {
-                        file: item,
-                        outcome: CopyOutcome::Copied { bytes },
-                    })
-                    .await;
+    if !cancellation.is_cancelled() {
+        if let Some(dated) =
+            resolve_units_over_usb(&cfg, source.as_ref(), &plan.units, &tx, &cancellation).await?
+        {
+            for item in dated.items {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                match item.action {
+                    PlannedAction::Copy => {
+                        if !send_file_started(&tx, &cancellation, item.clone()).await {
+                            break;
+                        }
+                        send_file_finished(
+                            &tx,
+                            &cancellation,
+                            &counters,
+                            total,
+                            item.clone(),
+                            FileOutcome::Copied {
+                                bytes: item.source_size,
+                            },
+                        )
+                        .await;
+                    }
+                    _ => emit_decided(&tx, item, &counters, total, &cancellation).await,
+                }
             }
-            _ => emit_decided(&tx, item, &mut tally).await,
         }
     }
 
-    let _ = tx
-        .send(EngineEvent::SyncSummary {
-            copied: tally.copied,
-            skipped: tally.skipped,
-            failed: tally.failed,
-        })
-        .await;
-    Ok(())
+    let summary = counters.summary(total, cancellation.is_cancelled());
+    emit_event(
+        &tx,
+        &cancellation,
+        EngineEvent::ExecutionFinished { summary },
+    )
+    .await;
+    Ok(summary)
 }
 
-#[derive(Default)]
-struct Tally {
-    copied: u64,
-    skipped: u64,
-    failed: u64,
-}
-
-/// Emit a CopyComplete for an already-decided (non-copy) planned item and
-/// bump the matching counter.
-async fn emit_decided(tx: &mpsc::Sender<EngineEvent>, item: PlannedFile, tally: &mut Tally) {
-    match item.action {
-        PlannedAction::Error => {
-            tally.failed += 1;
-            let error = item
+/// Emit a terminal outcome for an already-decided planned item.
+async fn emit_decided(
+    tx: &mpsc::Sender<EngineEvent>,
+    item: PlannedFile,
+    counters: &Counters,
+    total: u64,
+    cancellation: &CancellationHandle,
+) {
+    if !send_file_started(tx, cancellation, item.clone()).await {
+        return;
+    }
+    let outcome = match item.action {
+        PlannedAction::Error => FileOutcome::Failed {
+            error: item
                 .reason
                 .clone()
-                .unwrap_or_else(|| "planning error".to_string());
-            let _ = tx
-                .send(EngineEvent::CopyComplete {
-                    file: item,
-                    outcome: CopyOutcome::Failed { error },
-                })
-                .await;
-        }
-        _ => {
-            tally.skipped += 1;
-            let reason = item.reason.clone().unwrap_or_else(|| "skipped".to_string());
-            let _ = tx
-                .send(EngineEvent::CopyComplete {
-                    file: item,
-                    outcome: CopyOutcome::Skipped { reason },
-                })
-                .await;
-        }
-    }
+                .unwrap_or_else(|| "planning error".to_string()),
+        },
+        _ => FileOutcome::Skipped {
+            reason: item.reason.clone().unwrap_or_else(|| "skipped".to_string()),
+        },
+    };
+    send_file_finished(tx, cancellation, counters, total, item, outcome).await;
 }
 
 /// A file copied into staging, awaiting EXIF + placement.
@@ -617,9 +947,9 @@ struct StagedFile {
     mtime: Option<chrono::NaiveDateTime>,
 }
 
-/// Copy a single file into `seq_dir`, emitting CopyStarted/CopyProgress and, on
-/// failure, CopyComplete{Failed}. Returns the staged file on success. A failed
-/// `CopyStarted` send (consumer gone) sets `cancel` and returns `None`.
+/// Copy a single file into `seq_dir`, emitting file lifecycle events. A closed
+/// event receiver is treated as defensive cancellation.
+#[allow(clippy::too_many_arguments)]
 async fn copy_one_to_staging(
     cfg: &EngineConfig,
     source: &dyn MediaSource,
@@ -627,47 +957,71 @@ async fn copy_one_to_staging(
     kind: MediaKind,
     seq_dir: &std::path::Path,
     tx: &mpsc::Sender<EngineEvent>,
-    cancel: &std::sync::atomic::AtomicBool,
+    counters: &Counters,
+    total: u64,
+    cancellation: &CancellationHandle,
 ) -> Option<StagedFile> {
-    if tx
-        .send(EngineEvent::CopyStarted {
-            file: provisional_file(source.id(), f, kind),
-        })
-        .await
-        .is_err()
-    {
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if cancellation.is_cancelled() {
         return None;
     }
 
-    let src = match source.full_path(f).await {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = tx
-                .send(EngineEvent::CopyComplete {
-                    file: provisional_file(source.id(), f, kind),
-                    outcome: CopyOutcome::Failed {
-                        error: format!("{e}"),
-                    },
-                })
-                .await;
+    let file = provisional_file(source.id(), f, kind);
+    if !send_file_started(tx, cancellation, file.clone()).await
+        || !send_phase(tx, cancellation, file.id(), FilePhase::Copying).await
+        || cancellation.is_cancelled()
+    {
+        return None;
+    }
+
+    let source_path = match source.full_path(f).await {
+        Ok(path) => path,
+        Err(error) => {
+            send_file_finished(
+                tx,
+                cancellation,
+                counters,
+                total,
+                file,
+                FileOutcome::Failed {
+                    error: error.to_string(),
+                },
+            )
+            .await;
             return None;
         }
     };
+    if cancellation.is_cancelled() {
+        return None;
+    }
 
     let staged = seq_dir.join(file_name_of(&f.rel_path));
-    let rel = f.rel_path.clone();
+    let file_id = file.id();
     let tx2 = tx.clone();
-    let res = crate::copy::copy_atomic(&src, &staged, f.size, &cfg.verify, move |done, total| {
-        let _ = tx2.try_send(EngineEvent::CopyProgress {
-            rel_path: rel.clone(),
-            bytes_done: done,
-            bytes_total: total,
-        });
-    })
-    .await;
+    let callback_cancellation = cancellation.clone();
+    let result =
+        crate::copy::copy_atomic(&source_path, &staged, f.size, &cfg.verify, move |event| {
+            let event = match event {
+                crate::copy::CopyEvent::Progress {
+                    bytes_done,
+                    bytes_total,
+                } => EngineEvent::FileProgress {
+                    file: file_id.clone(),
+                    bytes_done,
+                    bytes_total,
+                },
+                crate::copy::CopyEvent::Verifying => EngineEvent::FilePhaseChanged {
+                    file: file_id.clone(),
+                    phase: FilePhase::Verifying,
+                },
+            };
+            match tx2.try_send(event) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => callback_cancellation.cancel(),
+            }
+        })
+        .await;
 
-    match res {
+    match result {
         Ok(_) => Some(StagedFile {
             staged_path: staged,
             rel_path: f.rel_path.clone(),
@@ -675,15 +1029,18 @@ async fn copy_one_to_staging(
             kind,
             mtime: f.mtime,
         }),
-        Err(e) => {
-            let _ = tx
-                .send(EngineEvent::CopyComplete {
-                    file: provisional_file(source.id(), f, kind),
-                    outcome: CopyOutcome::Failed {
-                        error: format!("{e}"),
-                    },
-                })
-                .await;
+        Err(error) => {
+            send_file_finished(
+                tx,
+                cancellation,
+                counters,
+                total,
+                file,
+                FileOutcome::Failed {
+                    error: error.to_string(),
+                },
+            )
+            .await;
             None
         }
     }
@@ -691,7 +1048,7 @@ async fn copy_one_to_staging(
 
 /// Date, dedupe and move one staged file into its final destination, using
 /// `route_kind` to pick the root (sidecars route with their parent) and `rm`
-/// for the capture date. Updates the shared `counters` and emits CopyComplete.
+/// for the capture date.
 #[allow(clippy::too_many_arguments)]
 async fn place_one(
     cfg: &EngineConfig,
@@ -699,25 +1056,44 @@ async fn place_one(
     dedupe: &tokio::sync::Mutex<DedupeCache>,
     f: &StagedFile,
     route_kind: MediaKind,
-    rm: &ResolvedMetadata,
+    metadata: &ResolvedMetadata,
     tx: &mpsc::Sender<EngineEvent>,
     counters: &Counters,
-    cancel: &std::sync::atomic::AtomicBool,
+    total: u64,
+    cancellation: &CancellationHandle,
 ) {
-    use std::sync::atomic::Ordering;
+    if cancellation.is_cancelled()
+        || !send_phase(
+            tx,
+            cancellation,
+            file_id(source_id, &f.rel_path),
+            FilePhase::ResolvingDestination,
+        )
+        .await
+    {
+        return;
+    }
 
     let name = file_name_of(&f.rel_path);
-    let dest = match plan::dest_path_for(cfg, route_kind, &rm.datetime, name) {
-        Ok(d) => d,
-        Err(e) => {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
+    let destination = match plan::dest_path_for(cfg, route_kind, &metadata.datetime, name) {
+        Ok(destination) => destination,
+        Err(error) => {
             let _ = tokio::fs::remove_file(&f.staged_path).await;
-            send_complete(
+            send_file_finished(
                 tx,
-                cancel,
-                placed_file(source_id, f, None, Some(rm), PlannedAction::Error, None),
-                CopyOutcome::Failed {
-                    error: format!("{e}"),
+                cancellation,
+                counters,
+                total,
+                placed_file(
+                    source_id,
+                    f,
+                    None,
+                    Some(metadata),
+                    PlannedAction::Error,
+                    None,
+                ),
+                FileOutcome::Failed {
+                    error: error.to_string(),
                 },
             )
             .await;
@@ -725,102 +1101,133 @@ async fn place_one(
         }
     };
 
+    if cancellation.is_cancelled() {
+        return;
+    }
     // Reserving under the cache lock makes a destination visible to later
     // units before this worker releases the lock to move its staged file.
-    let (action, reason) = dedupe.lock().await.reserve(&dest, name, f.size);
+    let (action, reason) = dedupe.lock().await.reserve(&destination, name, f.size);
     match action {
-        PlannedAction::Copy => match crate::copy::finalize_move(&f.staged_path, &dest).await {
-            Ok(()) => {
-                counters.copied.fetch_add(1, Ordering::Relaxed);
-                send_complete(
-                    tx,
-                    cancel,
-                    placed_file(
-                        source_id,
-                        f,
-                        Some(dest),
-                        Some(rm),
-                        PlannedAction::Copy,
-                        None,
-                    ),
-                    CopyOutcome::Copied { bytes: f.size },
-                )
-                .await;
+        PlannedAction::Copy => {
+            if !send_phase(
+                tx,
+                cancellation,
+                file_id(source_id, &f.rel_path),
+                FilePhase::Finalizing,
+            )
+            .await
+            {
+                return;
             }
-            Err(e) => {
-                counters.failed.fetch_add(1, Ordering::Relaxed);
-                let _ = tokio::fs::remove_file(&f.staged_path).await;
-                send_complete(
-                    tx,
-                    cancel,
-                    placed_file(
-                        source_id,
-                        f,
-                        Some(dest),
-                        Some(rm),
-                        PlannedAction::Error,
-                        None,
-                    ),
-                    CopyOutcome::Failed {
-                        error: format!("{e}"),
-                    },
-                )
-                .await;
+            match crate::copy::finalize_move(&f.staged_path, &destination).await {
+                Ok(()) => {
+                    send_file_finished(
+                        tx,
+                        cancellation,
+                        counters,
+                        total,
+                        placed_file(
+                            source_id,
+                            f,
+                            Some(destination),
+                            Some(metadata),
+                            PlannedAction::Copy,
+                            None,
+                        ),
+                        FileOutcome::Copied { bytes: f.size },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_file(&f.staged_path).await;
+                    send_file_finished(
+                        tx,
+                        cancellation,
+                        counters,
+                        total,
+                        placed_file(
+                            source_id,
+                            f,
+                            Some(destination),
+                            Some(metadata),
+                            PlannedAction::Error,
+                            None,
+                        ),
+                        FileOutcome::Failed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .await;
+                }
             }
-        },
+        }
         PlannedAction::Error => {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
             let _ = tokio::fs::remove_file(&f.staged_path).await;
             let error = reason
                 .clone()
-                .unwrap_or_else(|| "destination conflict".into());
-            send_complete(
+                .unwrap_or_else(|| "destination conflict".to_string());
+            send_file_finished(
                 tx,
-                cancel,
+                cancellation,
+                counters,
+                total,
                 placed_file(
                     source_id,
                     f,
-                    Some(dest),
-                    Some(rm),
+                    Some(destination),
+                    Some(metadata),
                     PlannedAction::Error,
                     reason,
                 ),
-                CopyOutcome::Failed { error },
+                FileOutcome::Failed { error },
             )
             .await;
         }
         _ => {
-            counters.skipped.fetch_add(1, Ordering::Relaxed);
             let _ = tokio::fs::remove_file(&f.staged_path).await;
-            let r = reason.clone().unwrap_or_else(|| "already exists".into());
-            send_complete(
+            let skipped = reason
+                .clone()
+                .unwrap_or_else(|| "already exists".to_string());
+            send_file_finished(
                 tx,
-                cancel,
-                placed_file(source_id, f, Some(dest), Some(rm), action, reason),
-                CopyOutcome::Skipped { reason: r },
+                cancellation,
+                counters,
+                total,
+                placed_file(
+                    source_id,
+                    f,
+                    Some(destination),
+                    Some(metadata),
+                    action,
+                    reason,
+                ),
+                FileOutcome::Skipped { reason: skipped },
             )
             .await;
         }
     }
 }
 
-/// A staged file we couldn't date at all (no EXIF, no mtime). Discard the
+/// A staged file we could not date at all (no EXIF, no mtime). Discard the
 /// staged copy and report it skipped.
 async fn place_no_date(
     source_id: &SourceId,
     f: &StagedFile,
     tx: &mpsc::Sender<EngineEvent>,
     counters: &Counters,
-    cancel: &std::sync::atomic::AtomicBool,
+    total: u64,
+    cancellation: &CancellationHandle,
 ) {
-    counters
-        .skipped
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cancellation.is_cancelled() {
+        return;
+    }
     let _ = tokio::fs::remove_file(&f.staged_path).await;
     let reason = "no usable date (no EXIF and no mtime)".to_string();
-    send_complete(
+    send_file_finished(
         tx,
-        cancel,
+        cancellation,
+        counters,
+        total,
         placed_file(
             source_id,
             f,
@@ -829,55 +1236,85 @@ async fn place_no_date(
             PlannedAction::SkipNoDate,
             Some(reason.clone()),
         ),
-        CopyOutcome::Skipped { reason },
+        FileOutcome::Skipped { reason },
     )
     .await;
 }
 
 /// Resolve copy units' dates over USB and date them via [`plan::build_plan`].
-/// Used by the dry-run / scan preview, which must show exact destinations
-/// without copying anything.
+/// Used by dry-run preview, which must show exact destinations without writing.
 async fn resolve_units_over_usb(
     cfg: &EngineConfig,
     source: &dyn MediaSource,
     units: &[CopyUnit],
     tx: &mpsc::Sender<EngineEvent>,
-) -> Result<SyncPlan> {
+    cancellation: &CancellationHandle,
+) -> Result<Option<SyncPlan>> {
     let mut flat: Vec<(SourceFile, MediaKind)> = Vec::new();
-    for u in units {
-        flat.push((u.parent.clone(), u.parent_kind));
-        for s in &u.sidecars {
-            flat.push((s.clone(), MediaKind::Sidecar));
+    for unit in units {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        flat.push((unit.parent.clone(), unit.parent_kind));
+        for sidecar in &unit.sidecars {
+            flat.push((sidecar.clone(), MediaKind::Sidecar));
         }
     }
 
-    let mut paths: Vec<PathBuf> = Vec::with_capacity(flat.len());
-    for (f, _) in &flat {
-        paths.push(source.full_path(f).await?);
+    let mut paths = Vec::with_capacity(flat.len());
+    for (file, _) in &flat {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        paths.push(source.full_path(file).await?);
+    }
+    if cancellation.is_cancelled() {
+        return Ok(None);
     }
 
     let exif = ExifTool::spawn().await?;
     let batch_size = cfg.performance.metadata_batch_size.max(1);
     let total = flat.len() as u64;
-    let mut metas: Vec<Option<ResolvedMetadata>> = Vec::with_capacity(flat.len());
+    let mut metadata = Vec::with_capacity(flat.len());
     for chunk in paths.chunks(batch_size) {
-        let raw = exif.read_batch(chunk).await?;
-        for m in &raw {
-            let idx = metas.len();
-            metas.push(metadata::resolve_one(&flat[idx].0, m));
+        if cancellation.is_cancelled() {
+            let _ = exif.shutdown().await;
+            return Ok(None);
         }
-        let _ = tx
-            .send(EngineEvent::MetadataProgress {
-                done: metas.len() as u64,
+        let raw = match exif.read_batch(chunk).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                let _ = exif.shutdown().await;
+                return Err(error);
+            }
+        };
+        for raw_metadata in &raw {
+            let index = metadata.len();
+            metadata.push(metadata::resolve_one(&flat[index].0, raw_metadata));
+        }
+        if !emit_event(
+            tx,
+            cancellation,
+            EngineEvent::MetadataProgress {
+                done: metadata.len() as u64,
                 total,
-            })
-            .await;
+            },
+        )
+        .await
+            || cancellation.is_cancelled()
+        {
+            let _ = exif.shutdown().await;
+            return Ok(None);
+        }
     }
     let _ = exif.shutdown().await;
 
-    let scanned: Vec<ScannedFile> = flat
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let scanned = flat
         .into_iter()
-        .zip(metas)
+        .zip(metadata)
         .map(|((file, kind), metadata)| ScannedFile {
             source: source.id().clone(),
             file,
@@ -885,7 +1322,7 @@ async fn resolve_units_over_usb(
             metadata,
         })
         .collect();
-    plan::build_plan(cfg, scanned)
+    Ok(Some(plan::build_plan(cfg, scanned)?))
 }
 
 /// Provisional planned row for in-flight copy events (dest unknown until placed).
@@ -902,6 +1339,13 @@ fn provisional_file(source_id: &SourceId, f: &SourceFile, kind: MediaKind) -> Pl
             .mtime
             .map(|_| DateSourceWire::from(crate::metadata::DateSource::FileMtime)),
         reason: None,
+    }
+}
+
+fn file_id(source: &SourceId, rel_path: &str) -> FileId {
+    FileId {
+        source: source.clone(),
+        rel_path: rel_path.to_string(),
     }
 }
 
@@ -978,6 +1422,7 @@ fn lock_destination_roots(
             let lock_path = root.join(".imagesync.lock");
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lock_path)
@@ -1104,24 +1549,24 @@ mod tests {
             async move {
                 let engine = Engine::new(cfg, registry);
                 let source = FilesystemSource::new("card", "card", src_root).into_arc();
-                let (handle, mut stream) = engine.scan_and_plan(source.clone());
-                let drain = tokio::spawn(async move { while stream.next().await.is_some() {} });
-                let plan = handle.await.unwrap().unwrap();
+                let Operation {
+                    mut events,
+                    completion,
+                    ..
+                } = engine.scan_and_plan(source.clone());
+                let drain = tokio::spawn(async move { while events.next().await.is_some() {} });
+                let scan = completion.await.unwrap().unwrap();
                 drain.await.unwrap();
 
-                let mut exec = engine.execute(plan, source, ExecuteOptions::default());
-                let mut summary = (0u64, 0u64, 0u64);
-                while let Some(ev) = exec.next().await {
-                    if let EngineEvent::SyncSummary {
-                        copied,
-                        skipped,
-                        failed,
-                    } = ev
-                    {
-                        summary = (copied, skipped, failed);
-                    }
-                }
-                summary
+                let Operation {
+                    mut events,
+                    completion,
+                    ..
+                } = engine.execute(scan.plan, source, ExecuteOptions::default());
+                let drain = tokio::spawn(async move { while events.next().await.is_some() {} });
+                let summary = completion.await.unwrap().unwrap();
+                drain.await.unwrap();
+                (summary.copied, summary.skipped, summary.failed)
             }
         };
 
@@ -1160,7 +1605,6 @@ mod tests {
     async fn parent_copy_failure_reports_each_sidecar() {
         use crate::config::{FiltersConfig, PerformanceConfig, VerifyConfig};
         use crate::source::FilesystemSource;
-        use std::sync::atomic::AtomicBool;
         use tokio::sync::Mutex;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1194,7 +1638,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let dedupe = Mutex::new(DedupeCache::new());
         let counters = Counters::default();
-        let cancel = AtomicBool::new(false);
+        let cancellation = CancellationHandle::new();
 
         process_unit(
             &cfg,
@@ -1206,16 +1650,17 @@ mod tests {
             0,
             &tx,
             &counters,
-            &cancel,
+            &cancellation,
+            2,
         )
         .await;
         drop(tx);
 
         let failed: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|event| match event {
-                EngineEvent::CopyComplete {
+                EngineEvent::FileFinished {
                     file,
-                    outcome: CopyOutcome::Failed { .. },
+                    outcome: FileOutcome::Failed { .. },
                 } => Some(file.source_rel_path),
                 _ => None,
             })
@@ -1228,9 +1673,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_sync_cleans_up_staging() {
+    async fn execution_setup_error_is_emitted_and_completed() {
         use crate::config::{FiltersConfig, PerformanceConfig, VerifyConfig};
         use crate::source::FilesystemSource;
+        use tokio_stream::StreamExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = EngineConfig {
+            images_root: tmp.path().join("missing-images"),
+            videos_root: tmp.path().join("missing-videos"),
+            images_template: "{yyyy}/{yyyy}-{mm}-{dd}".to_string(),
+            videos_template: "{yyyy}/{yyyy}-{mm}-{dd}".to_string(),
+            filters: FiltersConfig::default(),
+            performance: PerformanceConfig::default(),
+            verify: VerifyConfig::default(),
+            template_warnings: Vec::new(),
+        };
+        let engine = Engine::new(cfg, ProfileRegistry::with_builtins().unwrap());
+        let source = FilesystemSource::new("card", "card", tmp.path().to_path_buf()).into_arc();
+
+        let Operation {
+            mut events,
+            completion,
+            ..
+        } = engine.execute(SyncPlan::default(), source, ExecuteOptions::default());
+        let mut saw_destination_error = false;
+        while let Some(event) = events.next().await {
+            if matches!(
+                event,
+                EngineEvent::Error {
+                    kind: OperationErrorKind::Destination,
+                    ..
+                }
+            ) {
+                saw_destination_error = true;
+            }
+        }
+        let error = completion.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::DestRootMissing { .. }));
+        assert!(saw_destination_error, "setup error was not emitted");
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_cleans_up_staging_and_completes() {
+        use crate::config::{FiltersConfig, PerformanceConfig, VerifyConfig};
+        use crate::source::FilesystemSource;
+        use tokio_stream::StreamExt;
 
         let tmp = tempfile::tempdir().unwrap();
         let src_root = tmp.path().join("card");
@@ -1239,9 +1727,9 @@ mod tests {
         std::fs::create_dir_all(src_root.join("DCIM")).unwrap();
         std::fs::create_dir_all(&images).unwrap();
         std::fs::create_dir_all(&videos).unwrap();
-        for i in 0..40 {
+        for index in 0..40 {
             std::fs::write(
-                src_root.join(format!("DCIM/IMG{i:04}.JPG")),
+                src_root.join(format!("DCIM/IMG{index:04}.JPG")),
                 vec![7u8; 4096],
             )
             .unwrap();
@@ -1253,50 +1741,47 @@ mod tests {
             images_template: "{yyyy}/{yyyy}-{mm}-{dd}".to_string(),
             videos_template: "{yyyy}/{yyyy}-{mm}-{dd}".to_string(),
             filters: FiltersConfig::default(),
-            performance: PerformanceConfig::default(), // copy_workers = 1
+            performance: PerformanceConfig::default(),
             verify: VerifyConfig::default(),
             template_warnings: Vec::new(),
         };
-        let registry = ProfileRegistry::with_builtins().unwrap();
-        let engine = Engine::new(cfg, registry);
+        let engine = Engine::new(cfg, ProfileRegistry::with_builtins().unwrap());
         let source = FilesystemSource::new("card", "card", src_root).into_arc();
 
-        // Build the plan, then start executing and immediately drop the event
-        // stream to simulate the UI aborting.
-        let (handle, mut stream) = engine.scan_and_plan(source.clone());
-        {
-            use tokio_stream::StreamExt;
-            while stream.next().await.is_some() {}
-        }
-        let plan = handle.await.unwrap().unwrap();
+        let Operation {
+            mut events,
+            completion,
+            ..
+        } = engine.scan_and_plan(source.clone());
+        let scan_events = tokio::spawn(async move { while events.next().await.is_some() {} });
+        let scan = completion.await.unwrap().unwrap();
+        scan_events.await.unwrap();
 
-        let exec = engine.execute(plan, source, ExecuteOptions::default());
-        drop(exec); // consumer gone → engine should cancel and clean up
-
-        // The detached engine task finishes within a copy or two; poll for the
-        // staging area to be emptied.
-        let staging_clean = |root: &std::path::Path| {
-            let s = root.join(plan::STAGING_DIR_NAME);
-            !s.exists()
-                || std::fs::read_dir(&s)
-                    .map(|d| d.count() == 0)
-                    .unwrap_or(true)
-        };
-        let mut cleaned = false;
-        for _ in 0..100 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if staging_clean(&images) && staging_clean(&videos) {
-                cleaned = true;
-                break;
+        let expected_total = scan.plan.items.len() as u64;
+        let Operation {
+            mut events,
+            completion,
+            cancellation,
+        } = engine.execute(scan.plan, source, ExecuteOptions::default());
+        let mut cancelled = false;
+        while let Some(event) = events.next().await {
+            if matches!(event, EngineEvent::ExecutionStarted { .. }) {
+                cancellation.cancel();
+                cancelled = true;
             }
         }
-        assert!(cleaned, "staging area was not cleaned up after abort");
+        assert!(cancelled, "execution did not announce its start");
+        let summary = completion.await.unwrap().unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.total, expected_total);
 
-        // Abort should have stopped early — not all 40 files placed.
-        let placed = plan::DestIndex::build(&[images.as_path()]).len();
-        assert!(
-            placed < 40,
-            "abort should stop early, but placed {placed}/40"
-        );
+        for root in [&images, &videos] {
+            let staging = root.join(plan::STAGING_DIR_NAME);
+            assert!(
+                !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+                "staging area was not cleaned: {}",
+                staging.display()
+            );
+        }
     }
 }

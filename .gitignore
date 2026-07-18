@@ -18,3 +18,6 @@ Thumbs.db
 
 # Local benchmark config (contains user-specific paths)
 bench.config.toml
+
+# Local integration-test card and output library
+/.test/

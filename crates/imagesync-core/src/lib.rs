@@ -19,9 +19,12 @@ pub mod source;
 pub mod template;
 
 pub use config::EngineConfig;
-pub use engine::Engine;
+pub use engine::{CancellationHandle, Engine, Operation, ScanResult};
 pub use error::{Error, Result};
-pub use events::{CopyOutcome, EngineEvent, PlannedAction, PlannedFile};
+pub use events::{
+    DetectedProfile, EngineEvent, FileId, FileOutcome, FilePhase, OperationErrorKind, PlanSummary,
+    PlannedAction, PlannedFile, SyncSummary, WarningKind,
+};
 pub use plan::SyncPlan;
 pub use profiles::{CameraProfile, ProfileRegistry};
 pub use source::{FilesystemSource, MediaSource, SourceFile, SourceId};

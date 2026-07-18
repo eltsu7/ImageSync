@@ -5,11 +5,10 @@
 //!   SourceSelect  →  Confirm  →  Scan  →  Review  →  Sync  →  Summary
 //!
 //! Architecture: the TUI runs the render loop on the main task and drives
-//! the engine on separate tokio tasks. Engine events flow back through an
-//! `mpsc::UnboundedReceiver<EngineEvent>` that's polled non-blockingly each
-//! frame. Crossterm input events are polled with a short timeout so we can
-//! interleave rendering and engine progress without spawning a separate
-//! input thread.
+//! the engine operations directly. Engine events are polled non-blockingly
+//! each frame while the completion handles remain authoritative. Crossterm
+//! input events are polled with a short timeout so we can interleave rendering
+//! and engine progress without spawning a separate input thread.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -20,25 +19,34 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use imagesync_core::config::{AppConfig, RawMode};
 use imagesync_core::engine::ExecuteOptions;
-use imagesync_core::events::{CopyOutcome, EngineEvent, MediaKindWire, PlannedAction, PlannedFile};
+use imagesync_core::events::{
+    EngineEvent, FileOutcome, FilePhase, MediaKindWire, PlannedAction, PlannedFile, SyncSummary,
+};
 use imagesync_core::mount::{detect_mounts, DetectedMount, MountRank};
 use imagesync_core::plan::SyncPlan;
 use imagesync_core::source::{FilesystemSource, MediaSource};
-use imagesync_core::{Engine, EngineConfig, ProfileRegistry};
+use imagesync_core::{
+    CancellationHandle, Engine, EngineConfig, Operation, ProfileRegistry, ScanResult,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    pub config_path: Option<PathBuf>,
+    pub source: Option<PathBuf>,
+}
+
 /// Run the TUI. Sets up the terminal, runs the app loop, restores on exit.
-pub async fn run() -> Result<()> {
+pub async fn run(options: RunOptions) -> Result<()> {
     // Probe ExifTool early so users see a clear error instead of a cryptic
     // failure mid-scan.
     if let Err(e) = imagesync_core::exiftool::probe_version() {
@@ -47,20 +55,28 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    let (app_cfg, cfg_path) = load_app_config()?;
+    let (app_cfg, cfg_path) = load_app_config(options.config_path)?;
     let registry = ProfileRegistry::with_builtins().context("loading built-in camera profiles")?;
+    let mut app = App::new(app_cfg, cfg_path, registry);
+    if let Some(source) = options.source {
+        if !source.is_dir() {
+            anyhow::bail!("source is not a directory: {}", source.display());
+        }
+        app.choose_source(source);
+    }
 
     let mut terminal = ratatui::try_init().context("initialising terminal")?;
-    let result = App::new(app_cfg, cfg_path, registry)
-        .run(&mut terminal)
-        .await;
+    let result = app.run(&mut terminal).await;
     ratatui::restore();
     result
 }
 
-fn load_app_config() -> Result<(AppConfig, PathBuf)> {
-    let path =
-        AppConfig::default_path().context("could not determine config dir on this platform")?;
+fn load_app_config(config_path: Option<PathBuf>) -> Result<(AppConfig, PathBuf)> {
+    let path = match config_path {
+        Some(path) => path,
+        None => AppConfig::default_path()
+            .context("could not determine default config path on this platform")?,
+    };
     let cfg = AppConfig::load_or_default(&path)
         .with_context(|| format!("loading config from {}", path.display()))?;
     Ok((cfg, path))
@@ -116,21 +132,22 @@ impl DestField {
     }
 }
 
-type ScanResult = Result<(SyncPlan, Arc<dyn MediaSource>), String>;
-type ScanHandle = tokio::task::JoinHandle<ScanResult>;
+type ScanHandle = tokio::task::JoinHandle<imagesync_core::Result<ScanResult>>;
+type SyncHandle = tokio::task::JoinHandle<imagesync_core::Result<SyncSummary>>;
 
 /// Hard cap on rendered worker lanes. Beyond this we'd eat the whole
 /// screen with progress bars; high-worker-count users still see the
 /// total-progress gauge and the log.
 const MAX_VISIBLE_SLOTS: usize = 8;
 
-/// One in-flight copy in the sync screen. Identified by `rel_path` so
-/// `CopyProgress` events can find the right lane.
+/// One active file operation in the sync screen. Identified by `rel_path` so
+/// progress and phase events can update the right lane.
 #[derive(Debug, Clone)]
 struct CopySlot {
     rel_path: String,
     bytes_done: u64,
     bytes_total: u64,
+    phase: Option<FilePhase>,
 }
 
 struct App {
@@ -165,8 +182,10 @@ struct App {
     detected_profile_name: Option<String>,
 
     // Scan
-    scan_rx: Option<mpsc::UnboundedReceiver<EngineEvent>>,
+    scan_rx: Option<ReceiverStream<EngineEvent>>,
     scan_handle: Option<ScanHandle>,
+    scan_cancellation: Option<CancellationHandle>,
+    scan_cancelling: bool,
     scan_status: String,
     scan_files_total: u64,
     meta_done: u64,
@@ -181,24 +200,24 @@ struct App {
     review_state: ListState,
 
     // Sync
-    sync_rx: Option<mpsc::UnboundedReceiver<EngineEvent>>,
-    sync_handle: Option<tokio::task::JoinHandle<()>>,
-    sync_total_copy: u64,
-    sync_done_copy: u64,
-    sync_failed: u64,
-    sync_skipped: u64,
+    sync_rx: Option<ReceiverStream<EngineEvent>>,
+    sync_handle: Option<SyncHandle>,
+    sync_cancellation: Option<CancellationHandle>,
+    sync_cancelling: bool,
+    sync_progress: SyncSummary,
     sync_log: Vec<String>,
+    /// Structured warnings/errors retained independently of the bounded live
+    /// log so terminal summaries never lose diagnostics.
+    sync_diagnostics: Vec<String>,
     /// One slot per copy worker (lane). `Some` when that lane is
-    /// actively copying a file, `None` when idle. Sized at sync-start
+    /// actively processing a file, `None` when idle. Sized at sync-start
     /// from `cfg.performance.copy_workers`, capped at `MAX_VISIBLE_SLOTS`.
     sync_slots: Vec<Option<CopySlot>>,
     dry_run: bool,
 
-    // Final summary
-    summary_copied: u64,
-    summary_skipped: u64,
-    summary_failed: u64,
-    summary_cancelled: bool,
+    // Final summary, supplied only by the authoritative execution completion.
+    sync_summary: Option<SyncSummary>,
+    sync_error: Option<String>,
 }
 
 impl App {
@@ -246,6 +265,8 @@ impl App {
             detected_profile_name: None,
             scan_rx: None,
             scan_handle: None,
+            scan_cancellation: None,
+            scan_cancelling: false,
             scan_status: String::new(),
             scan_error: None,
             scan_files_total: 0,
@@ -256,17 +277,15 @@ impl App {
             review_state: ListState::default(),
             sync_rx: None,
             sync_handle: None,
-            sync_total_copy: 0,
-            sync_done_copy: 0,
-            sync_failed: 0,
-            sync_skipped: 0,
+            sync_cancellation: None,
+            sync_cancelling: false,
+            sync_progress: SyncSummary::default(),
             sync_log: Vec::new(),
+            sync_diagnostics: Vec::new(),
             sync_slots: Vec::new(),
             dry_run: false,
-            summary_copied: 0,
-            summary_skipped: 0,
-            summary_failed: 0,
-            summary_cancelled: false,
+            sync_summary: None,
+            sync_error: None,
         }
     }
 
@@ -299,12 +318,21 @@ impl App {
             self.poll_handles().await;
         }
 
-        // Best-effort: cancel any running engine task on quit.
-        if let Some(h) = self.scan_handle.take() {
-            h.abort();
+        // Request cancellation, keep draining bounded event streams, and wait
+        // for authoritative completion so staging cleanup finishes before the
+        // Tokio runtime and process exit.
+        if let Some(cancellation) = &self.scan_cancellation {
+            cancellation.cancel();
         }
-        if let Some(h) = self.sync_handle.take() {
-            h.abort();
+        if let Some(cancellation) = &self.sync_cancellation {
+            cancellation.cancel();
+        }
+        while self.scan_handle.is_some() || self.sync_handle.is_some() {
+            self.pump_engine_events();
+            self.poll_handles().await;
+            if self.scan_handle.is_some() || self.sync_handle.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         Ok(())
@@ -312,57 +340,68 @@ impl App {
 
     // -----------------------------------------------------------------------
     // Engine plumbing
-    // -----------------------------------------------------------------------
-
     fn pump_engine_events(&mut self) {
-        // Drain whichever channel is currently active. Borrow rules force
-        // taking ownership of buffered events first, then dispatching.
-        let mut events: Vec<EngineEvent> = Vec::new();
-        if let Some(rx) = self.scan_rx.as_mut() {
-            while let Ok(ev) = rx.try_recv() {
-                events.push(ev);
-            }
-        }
-        for ev in events.drain(..) {
-            self.on_scan_event(ev);
-        }
+        self.drain_scan_events();
+        self.drain_sync_events();
+    }
 
-        if let Some(rx) = self.sync_rx.as_mut() {
-            while let Ok(ev) = rx.try_recv() {
-                events.push(ev);
+    fn drain_scan_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(rx) = self.scan_rx.as_mut() {
+            while let Ok(event) = rx.as_mut().try_recv() {
+                events.push(event);
             }
         }
-        for ev in events.drain(..) {
-            self.on_sync_event(ev);
+        for event in events {
+            self.on_scan_event(event);
+        }
+    }
+
+    fn drain_sync_events(&mut self) {
+        let mut events = Vec::new();
+        if let Some(rx) = self.sync_rx.as_mut() {
+            while let Ok(event) = rx.as_mut().try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.on_sync_event(event);
         }
     }
 
     async fn poll_handles(&mut self) {
-        // Scan task complete?
         if self
             .scan_handle
             .as_ref()
-            .map(|h| h.is_finished())
-            .unwrap_or(false)
+            .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            let h = self.scan_handle.take().unwrap();
-            match h.await {
-                Ok(Ok((plan, src))) => {
-                    self.plan = Some(plan);
-                    self.plan_source = Some(src);
-                    self.review_state.select(Some(0));
-                    self.screen = Screen::Review;
-                    self.scan_rx = None;
+            let completion = self.scan_handle.take().unwrap().await;
+            self.drain_scan_events();
+            self.scan_rx = None;
+            self.scan_cancellation = None;
+            match completion {
+                Ok(Ok(ScanResult { plan, profile })) => {
+                    if self.scan_cancelling {
+                        self.plan_source = None;
+                        self.scan_cancelling = false;
+                        self.screen = Screen::SourceSelect;
+                    } else {
+                        self.plan = Some(plan);
+                        self.detected_profile_name = Some(profile.display_name);
+                        self.review_state.select(Some(0));
+                        self.screen = Screen::Review;
+                    }
                 }
-                Ok(Err(msg)) => {
-                    // Stay on the Scan screen and show the error so it isn't a
-                    // silent flash back to source select.
-                    self.scan_error = Some(msg);
-                    self.scan_rx = None;
+                Ok(Err(_error)) if self.scan_cancelling => {
+                    self.plan_source = None;
+                    self.scan_cancelling = false;
+                    self.screen = Screen::SourceSelect;
                 }
-                Err(e) => {
-                    self.scan_error = Some(format!("scan task panicked: {e}"));
-                    self.scan_rx = None;
+                Ok(Err(error)) => {
+                    self.scan_error = Some(error.to_string());
+                }
+                Err(error) => {
+                    self.scan_error = Some(format!("scan task panicked: {error}"));
                 }
             }
         }
@@ -370,30 +409,35 @@ impl App {
         if self
             .sync_handle
             .as_ref()
-            .map(|h| h.is_finished())
-            .unwrap_or(false)
+            .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            let h = self.sync_handle.take().unwrap();
-            let _ = h.await;
-            // Drain remaining buffered events (notably SyncSummary) before
-            // flipping to the summary screen — without this, the summary
-            // shows zeroes when the sync completed faster than one tick.
-            let mut leftover: Vec<EngineEvent> = Vec::new();
-            if let Some(rx) = self.sync_rx.as_mut() {
-                while let Ok(ev) = rx.try_recv() {
-                    leftover.push(ev);
+            let completion = self.sync_handle.take().unwrap().await;
+            self.drain_sync_events();
+            self.sync_rx = None;
+            self.sync_cancellation = None;
+            self.sync_cancelling = false;
+            match completion {
+                Ok(Ok(summary)) => {
+                    self.sync_progress = summary;
+                    self.sync_summary = Some(summary);
+                }
+                Ok(Err(error)) => {
+                    self.sync_error = Some(format!("sync failed: {error}"));
+                }
+                Err(error) => {
+                    let message = format!("sync task panicked: {error}");
+                    let diagnostic = format!(" ERROR {message}");
+                    push_log(&mut self.sync_log, diagnostic.clone());
+                    self.sync_diagnostics.push(diagnostic);
+                    self.sync_error = Some(message);
                 }
             }
-            for ev in leftover {
-                self.on_sync_event(ev);
-            }
-            self.sync_rx = None;
             self.screen = Screen::Summary;
         }
     }
 
-    fn on_scan_event(&mut self, ev: EngineEvent) {
-        match ev {
+    fn on_scan_event(&mut self, event: EngineEvent) {
+        match event {
             EngineEvent::ScanStarted { display_name, .. } => {
                 self.scan_status = format!("scanning {display_name}…");
             }
@@ -404,17 +448,18 @@ impl App {
                 self.scan_files_total = files;
                 self.scan_status = format!("{files} files enumerated");
             }
+            EngineEvent::ProfileDetected { profile } => {
+                self.detected_profile_name = Some(profile.display_name);
+            }
             EngineEvent::MetadataProgress { done, total } => {
                 self.meta_done = done;
                 self.meta_total = total;
             }
-            EngineEvent::PlanReady {
-                copies,
-                skips,
-                errors,
-            } => {
-                self.scan_status =
-                    format!("plan ready: {copies} copies, {skips} skips, {errors} errors");
+            EngineEvent::PlanReady { summary } => {
+                self.scan_status = format!(
+                    "plan ready: {} copies, {} skips, {} errors",
+                    summary.copies, summary.skips, summary.errors
+                );
             }
             EngineEvent::Warning { message, .. } => {
                 self.status = Some(format!("warn: {message}"));
@@ -426,39 +471,43 @@ impl App {
         }
     }
 
-    fn on_sync_event(&mut self, ev: EngineEvent) {
-        match ev {
-            EngineEvent::CopyStarted { file } => {
+    fn on_sync_event(&mut self, event: EngineEvent) {
+        match event {
+            EngineEvent::ExecutionStarted { total_files, .. } => {
+                self.sync_progress = SyncSummary {
+                    total: total_files,
+                    ..SyncSummary::default()
+                };
+            }
+            EngineEvent::FileStarted { file } => {
                 self.start_slot(file.source_rel_path, file.source_size);
             }
-            EngineEvent::CopyProgress {
-                rel_path,
+            EngineEvent::FilePhaseChanged { file, phase } => {
+                self.update_slot_phase(&file.rel_path, phase);
+            }
+            EngineEvent::FileProgress {
+                file,
                 bytes_done,
                 bytes_total,
             } => {
-                self.update_slot(&rel_path, bytes_done, bytes_total);
+                self.update_slot(&file.rel_path, bytes_done, bytes_total);
             }
-            EngineEvent::CopyComplete { file, outcome } => {
+            EngineEvent::FileFinished { file, outcome } => {
                 self.free_slot(&file.source_rel_path);
                 match outcome {
-                    CopyOutcome::Copied { .. } => {
-                        if file.action == PlannedAction::Copy {
-                            self.sync_done_copy += 1;
-                        }
+                    FileOutcome::Copied { .. } => {
                         push_log(
                             &mut self.sync_log,
                             format!(" OK   {}", file.source_rel_path),
                         );
                     }
-                    CopyOutcome::Skipped { reason } => {
-                        self.sync_skipped += 1;
+                    FileOutcome::Skipped { reason } => {
                         push_log(
                             &mut self.sync_log,
                             format!(" SKIP {} ({reason})", file.source_rel_path),
                         );
                     }
-                    CopyOutcome::Failed { error } => {
-                        self.sync_failed += 1;
+                    FileOutcome::Failed { error } => {
                         push_log(
                             &mut self.sync_log,
                             format!(" FAIL {} ({error})", file.source_rel_path),
@@ -466,14 +515,29 @@ impl App {
                     }
                 }
             }
-            EngineEvent::SyncSummary {
-                copied,
-                skipped,
-                failed,
-            } => {
-                self.summary_copied = copied;
-                self.summary_skipped = skipped;
-                self.summary_failed = failed;
+            EngineEvent::ExecutionProgress { summary }
+            | EngineEvent::ExecutionFinished { summary } => {
+                self.sync_progress = summary;
+            }
+            EngineEvent::Warning { message, file, .. } => {
+                let suffix = file
+                    .as_ref()
+                    .map(|file| format!(" ({})", file.rel_path))
+                    .unwrap_or_default();
+                let diagnostic = format!(" WARN  {message}{suffix}");
+                push_log(&mut self.sync_log, diagnostic.clone());
+                self.sync_diagnostics.push(diagnostic);
+                self.status = Some(format!("warn: {message}"));
+            }
+            EngineEvent::Error { message, file, .. } => {
+                let suffix = file
+                    .as_ref()
+                    .map(|file| format!(" ({})", file.rel_path))
+                    .unwrap_or_default();
+                let diagnostic = format!(" ERROR {message}{suffix}");
+                push_log(&mut self.sync_log, diagnostic.clone());
+                self.sync_diagnostics.push(diagnostic);
+                self.status = Some(format!("error: {message}"));
             }
             _ => {}
         }
@@ -494,6 +558,7 @@ impl App {
         {
             slot.bytes_done = 0;
             slot.bytes_total = bytes_total;
+            slot.phase = Some(FilePhase::Copying);
             return;
         }
         if let Some(empty) = self.sync_slots.iter_mut().find(|s| s.is_none()) {
@@ -501,6 +566,7 @@ impl App {
                 rel_path,
                 bytes_done: 0,
                 bytes_total,
+                phase: Some(FilePhase::Copying),
             });
             return;
         }
@@ -516,6 +582,7 @@ impl App {
                 rel_path,
                 bytes_done: 0,
                 bytes_total,
+                phase: Some(FilePhase::Copying),
             });
         }
     }
@@ -529,6 +596,17 @@ impl App {
         {
             slot.bytes_done = bytes_done;
             slot.bytes_total = bytes_total;
+        }
+    }
+
+    fn update_slot_phase(&mut self, rel_path: &str, phase: FilePhase) {
+        if let Some(slot) = self
+            .sync_slots
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.rel_path == rel_path)
+        {
+            slot.phase = Some(phase);
         }
     }
 
@@ -639,9 +717,9 @@ impl App {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-        // Resolve which profile would be used.
-        let profile = self.registry.detect_for_source(&path);
-        self.detected_profile_name = Some(profile.display_name.clone());
+        // Profile selection is part of the engine scan, not a frontend
+        // heuristic. Show that honestly until the scan reports its result.
+        self.detected_profile_name = Some("auto-detected during scan".into());
         self.chosen_label = Some(label);
         self.chosen_source = Some(path);
         self.status = None;
@@ -828,15 +906,16 @@ impl App {
     }
 
     fn on_key_scan(&mut self, key: KeyEvent) {
-        // Any key dismisses a failed scan; otherwise Esc/q cancels an
-        // in-progress one. Both return to source select.
-        if self.scan_error.is_some() || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            if let Some(h) = self.scan_handle.take() {
-                h.abort();
-            }
-            self.scan_rx = None;
+        if self.scan_error.is_some() {
             self.scan_error = None;
+            self.plan_source = None;
             self.screen = Screen::SourceSelect;
+        } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.scan_cancelling {
+            if let Some(cancellation) = &self.scan_cancellation {
+                cancellation.cancel();
+                self.scan_cancelling = true;
+                self.scan_status = "cancelling scan…".into();
+            }
         }
     }
 
@@ -879,20 +958,12 @@ impl App {
     }
 
     fn on_key_sync(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            // Abort: cancel the engine task. The engine will stop spawning
-            // new copies; in-flight copies finish.
-            if let Some(h) = self.sync_handle.take() {
-                h.abort();
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.sync_cancelling {
+            if let Some(cancellation) = &self.sync_cancellation {
+                cancellation.cancel();
+                self.sync_cancelling = true;
+                self.status = Some("cancelling sync…".into());
             }
-            self.sync_rx = None;
-            // The engine never gets to send SyncSummary on abort, so seed
-            // the summary from the live counters we've been maintaining.
-            self.summary_copied = self.sync_done_copy;
-            self.summary_skipped = self.sync_skipped;
-            self.summary_failed = self.sync_failed;
-            self.summary_cancelled = true;
-            self.screen = Screen::Summary;
         }
     }
 
@@ -920,16 +991,14 @@ impl App {
         self.scan_files_total = 0;
         self.meta_done = 0;
         self.meta_total = 0;
-        self.sync_total_copy = 0;
-        self.sync_done_copy = 0;
-        self.sync_failed = 0;
-        self.sync_skipped = 0;
+        self.scan_cancelling = false;
+        self.sync_progress = SyncSummary::default();
         self.sync_log.clear();
+        self.sync_diagnostics.clear();
         self.sync_slots.clear();
-        self.summary_copied = 0;
-        self.summary_skipped = 0;
-        self.summary_failed = 0;
-        self.summary_cancelled = false;
+        self.sync_cancelling = false;
+        self.sync_summary = None;
+        self.sync_error = None;
         self.dry_run = false;
         self.status = None;
         self.mounts = detect_mounts();
@@ -963,76 +1032,62 @@ impl App {
             FilesystemSource::new(src_path.to_string_lossy().to_string(), label, src_path)
                 .into_arc();
 
-        let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
-        self.scan_rx = Some(rx);
+        let engine = Engine::new(engine_cfg, registry);
+        let Operation {
+            events,
+            completion,
+            cancellation,
+        } = engine.scan_and_plan(source.clone());
+        self.plan_source = Some(source);
+        self.scan_rx = Some(events);
+        self.scan_handle = Some(completion);
+        self.scan_cancellation = Some(cancellation);
+        self.scan_cancelling = false;
         self.scan_status = "starting…".into();
         self.scan_error = None;
         self.scan_files_total = 0;
         self.meta_done = 0;
         self.meta_total = 0;
         self.screen = Screen::Scan;
-
-        let handle = tokio::spawn(async move {
-            let engine = Engine::new(engine_cfg, registry);
-            let (plan_handle, mut events) = engine.scan_and_plan(source.clone());
-            // Forward live events as the engine emits them.
-            while let Some(ev) = events.next().await {
-                let _ = tx.send(ev);
-            }
-            // Stream is closed when the engine task drops the sender, i.e.
-            // when the work has finished. Then collect the plan.
-            match plan_handle.await {
-                Ok(Ok(plan)) => Ok((plan, source)),
-                Ok(Err(e)) => Err(format!("{e}")),
-                Err(e) => Err(format!("scan task: {e}")),
-            }
-        });
-        self.scan_handle = Some(handle);
     }
 
     fn start_sync(&mut self, dry_run: bool) {
         let (Some(plan), Some(source)) = (self.plan.take(), self.plan_source.clone()) else {
             return;
         };
+        let engine_cfg = match EngineConfig::try_from_app(&self.cfg) {
+            Ok(config) => config,
+            Err(error) => {
+                self.plan = Some(plan);
+                self.status = Some(format!("config error: {error}"));
+                return;
+            }
+        };
+
         self.dry_run = dry_run;
-        self.sync_total_copy = plan.copies();
-        self.sync_done_copy = 0;
-        self.sync_failed = 0;
-        self.sync_skipped = 0;
+        self.sync_progress = SyncSummary::default();
         self.sync_log.clear();
+        self.sync_diagnostics.clear();
         let lanes = self
             .cfg
             .performance
             .copy_workers
             .clamp(1, MAX_VISIBLE_SLOTS);
         self.sync_slots = vec![None; lanes];
-        self.summary_copied = 0;
-        self.summary_skipped = 0;
-        self.summary_failed = 0;
-        self.summary_cancelled = false;
+        self.sync_summary = None;
+        self.sync_error = None;
+        self.sync_cancelling = false;
         self.screen = Screen::Sync;
 
-        let engine_cfg = match EngineConfig::try_from_app(&self.cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status = Some(format!("config error: {e}"));
-                self.screen = Screen::Review;
-                return;
-            }
-        };
-        let registry = self.registry.clone();
-
-        let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
-        self.sync_rx = Some(rx);
-
-        let handle = tokio::spawn(async move {
-            let engine = Engine::new(engine_cfg, registry);
-            let mut events = engine.execute(plan, source, ExecuteOptions { dry_run });
-            while let Some(ev) = events.next().await {
-                let _ = tx.send(ev);
-            }
-        });
-        self.sync_handle = Some(handle);
+        let engine = Engine::new(engine_cfg, self.registry.clone());
+        let Operation {
+            events,
+            completion,
+            cancellation,
+        } = engine.execute(plan, source, ExecuteOptions { dry_run });
+        self.sync_rx = Some(events);
+        self.sync_handle = Some(completion);
+        self.sync_cancellation = Some(cancellation);
     }
 
     // -----------------------------------------------------------------------
@@ -1514,32 +1569,36 @@ impl App {
         // (border + bar + border). Total gauge takes 3, log needs at
         // least 3.
         let lanes_requested = self.sync_slots.len();
-        let max_fit = (area.height as usize)
-            .saturating_sub(3 + 3) // total + min log
-            / 3;
+        let max_fit = (area.height as usize).saturating_sub(3 + 3) / 3;
         let lanes_visible = lanes_requested.min(max_fit).max(1);
         let lanes_hidden = lanes_requested.saturating_sub(lanes_visible);
 
         let mut constraints: Vec<Constraint> = Vec::with_capacity(lanes_visible + 2);
-        constraints.push(Constraint::Length(3)); // total
+        constraints.push(Constraint::Length(3));
         for _ in 0..lanes_visible {
             constraints.push(Constraint::Length(3));
         }
-        constraints.push(Constraint::Min(3)); // log
+        constraints.push(Constraint::Min(3));
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
 
-        // Total progress
-        let pct = if self.sync_total_copy > 0 {
-            ((self.sync_done_copy + self.sync_failed) as f64 / self.sync_total_copy as f64).min(1.0)
+        // ExecutionProgress is the source of truth: skipped files count as
+        // completed too, so the gauge advances even when no bytes are copied.
+        let completed = self.sync_progress.completed();
+        let pct = if self.sync_progress.total > 0 {
+            (completed as f64 / self.sync_progress.total as f64).min(1.0)
         } else {
             1.0
         };
         let mut total_label = format!(
-            "{}/{} copied · {} failed · {} skipped",
-            self.sync_done_copy, self.sync_total_copy, self.sync_failed, self.sync_skipped
+            "{}/{} complete · {} copied · {} failed · {} skipped",
+            completed,
+            self.sync_progress.total,
+            self.sync_progress.copied,
+            self.sync_progress.failed,
+            self.sync_progress.skipped
         );
         if lanes_hidden > 0 {
             total_label.push_str(&format!(" · +{lanes_hidden} more lanes hidden"));
@@ -1559,46 +1618,51 @@ impl App {
             .label(total_label);
         f.render_widget(total_gauge, rows[0]);
 
-        // Per-lane gauges
         for i in 0..lanes_visible {
-            let area = rows[1 + i];
+            let lane_area = rows[1 + i];
             let title = format!(" worker {} ", i + 1);
-            let (lane_pct, lane_label) = match self.sync_slots.get(i).and_then(|s| s.as_ref()) {
+            let (lane_pct, lane_label) = match self.sync_slots.get(i).and_then(|slot| slot.as_ref())
+            {
                 Some(slot) if slot.bytes_total > 0 => (
                     (slot.bytes_done as f64 / slot.bytes_total as f64).min(1.0),
                     format!(
-                        "{}  {}/{}",
+                        "{} — {}  {}/{}",
                         slot.rel_path,
+                        file_phase_label(slot.phase),
                         human_bytes(slot.bytes_done),
                         human_bytes(slot.bytes_total)
                     ),
                 ),
-                Some(slot) => (0.0, slot.rel_path.clone()),
+                Some(slot) => (
+                    0.0,
+                    format!("{} — {}", slot.rel_path, file_phase_label(slot.phase)),
+                ),
                 None => (0.0, "(idle)".to_string()),
             };
-            let g = Gauge::default()
+            let gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).title(title))
                 .gauge_style(Style::default().fg(Color::Cyan))
                 .ratio(lane_pct)
                 .label(lane_label);
-            f.render_widget(g, area);
+            f.render_widget(gauge, lane_area);
         }
 
-        // Log (last N lines)
         let log_area = rows[1 + lanes_visible];
-        let log_h = log_area.height.saturating_sub(2) as usize;
-        let take = self.sync_log.len().saturating_sub(log_h);
-        let body: Vec<Line> = self.sync_log[take..]
+        let log_height = log_area.height.saturating_sub(2) as usize;
+        let first_line = self.sync_log.len().saturating_sub(log_height);
+        let body: Vec<Line> = self.sync_log[first_line..]
             .iter()
-            .map(|l| {
-                let style = if l.contains("FAIL") {
+            .map(|line| {
+                let style = if line.contains("FAIL") || line.contains("ERROR") {
                     Style::default().fg(Color::Red)
-                } else if l.contains("SKIP") {
+                } else if line.contains("WARN") {
+                    Style::default().fg(Color::Yellow)
+                } else if line.contains("SKIP") {
                     Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default().fg(Color::Green)
                 };
-                Line::styled(l.clone(), style)
+                Line::styled(line.clone(), style)
             })
             .collect();
         f.render_widget(
@@ -1610,33 +1674,62 @@ impl App {
     // ------- Screen: Summary -------
 
     fn render_summary(&self, f: &mut Frame, area: Rect) {
-        let (heading, heading_color) = if self.summary_cancelled {
-            ("Sync cancelled — partial results below.", Color::Yellow)
+        let summary = self.sync_summary.unwrap_or_default();
+        let (heading, heading_color) = if let Some(error) = &self.sync_error {
+            (format!("Sync did not complete: {error}"), Color::Red)
+        } else if summary.cancelled {
+            (
+                "Sync cancelled — core-reported partial results below.".into(),
+                Color::Yellow,
+            )
         } else if self.dry_run {
-            ("Dry run complete. No files were written.", Color::Green)
+            (
+                "Dry run complete. No files were written.".into(),
+                Color::Green,
+            )
         } else {
-            ("Sync complete.", Color::Green)
+            ("Sync complete.".into(), Color::Green)
         };
-        let body = vec![
+        let mut body = vec![
             Line::raw(""),
             Line::from(Span::styled(
                 heading,
                 Style::default().fg(heading_color).bold(),
             )),
             Line::raw(""),
-            Line::from(vec![
-                Span::styled("Copied:  ", Style::default().fg(Color::Green)),
-                Span::raw(self.summary_copied.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("Skipped: ", Style::default().fg(Color::Cyan)),
-                Span::raw(self.summary_skipped.to_string()),
-            ]),
-            Line::from(vec![
-                Span::styled("Failed:  ", Style::default().fg(Color::Red)),
-                Span::raw(self.summary_failed.to_string()),
-            ]),
         ];
+        if self.sync_summary.is_some() {
+            body.extend([
+                Line::from(vec![
+                    Span::styled("Completed: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!("{}/{}", summary.completed(), summary.total)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Copied:    ", Style::default().fg(Color::Green)),
+                    Span::raw(summary.copied.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Skipped:   ", Style::default().fg(Color::Cyan)),
+                    Span::raw(summary.skipped.to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Failed:    ", Style::default().fg(Color::Red)),
+                    Span::raw(summary.failed.to_string()),
+                ]),
+            ]);
+        }
+        if !self.sync_diagnostics.is_empty() {
+            body.push(Line::raw(""));
+            body.push(Line::from(Span::styled(
+                "Warnings and errors:",
+                Style::default().fg(Color::Yellow),
+            )));
+            body.extend(
+                self.sync_diagnostics
+                    .iter()
+                    .map(|diagnostic| Line::raw(diagnostic.clone())),
+            );
+        }
         f.render_widget(
             Paragraph::new(body)
                 .block(Block::default().borders(Borders::ALL).title(" done "))
@@ -1656,6 +1749,17 @@ fn push_log(buf: &mut Vec<String>, s: String) {
     if buf.len() > MAX {
         let drop = buf.len() - MAX;
         buf.drain(..drop);
+    }
+}
+
+fn file_phase_label(phase: Option<FilePhase>) -> &'static str {
+    match phase {
+        Some(FilePhase::Copying) => "copying",
+        Some(FilePhase::Verifying) => "verifying",
+        Some(FilePhase::ReadingMetadata) => "reading metadata",
+        Some(FilePhase::ResolvingDestination) => "resolving destination",
+        Some(FilePhase::Finalizing) => "finalizing",
+        None => "starting",
     }
 }
 
