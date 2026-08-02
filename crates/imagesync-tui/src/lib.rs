@@ -31,7 +31,10 @@ use imagesync_core::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::{DefaultTerminal, Frame};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -164,6 +167,8 @@ struct App {
     sources_state: ListState,
     manual_path: String,
     manual_focused: bool,
+    source_action: usize,
+    source_actions_focused: bool,
 
     // Destination editor (live buffers; copied to cfg on accept)
     dest_images_root: String,
@@ -171,6 +176,12 @@ struct App {
     dest_images_template: String,
     dest_videos_template: String,
     dest_field: DestField,
+    dest_cursor: usize,
+    confirm_action: usize,
+    save_action: usize,
+    review_action: usize,
+    review_actions_focused: bool,
+    summary_action: usize,
 
     // Filters (raw_mode picker on Confirm)
     raw_mode_disk: RawMode,
@@ -205,6 +216,9 @@ struct App {
     sync_cancellation: Option<CancellationHandle>,
     sync_cancelling: bool,
     sync_progress: SyncSummary,
+    /// Number of copy candidates in the executed plan. Pre-existing/runtime
+    /// skips are deliberately excluded from the import-progress denominator.
+    sync_copy_total: u64,
     sync_log: Vec<String>,
     /// Structured warnings/errors retained independently of the bounded live
     /// log so terminal summaries never lose diagnostics.
@@ -253,11 +267,19 @@ impl App {
             sources_state,
             manual_path: String::new(),
             manual_focused: false,
+            source_action: 0,
+            source_actions_focused: false,
             dest_images_root,
             dest_videos_root,
             dest_images_template,
             dest_videos_template,
             dest_field: DestField::ImagesRoot,
+            dest_cursor: 0,
+            confirm_action: 0,
+            save_action: 0,
+            review_action: 0,
+            review_actions_focused: false,
+            summary_action: 0,
             raw_mode_disk,
             save_prompt_next: SavePromptNext::Confirm,
             chosen_source: None,
@@ -280,6 +302,7 @@ impl App {
             sync_cancellation: None,
             sync_cancelling: false,
             sync_progress: SyncSummary::default(),
+            sync_copy_total: 0,
             sync_log: Vec::new(),
             sync_diagnostics: Vec::new(),
             sync_slots: Vec::new(),
@@ -389,6 +412,7 @@ impl App {
                         self.plan = Some(plan);
                         self.detected_profile_name = Some(profile.display_name);
                         self.review_state.select(Some(0));
+                        self.review_actions_focused = true;
                         self.screen = Screen::Review;
                     }
                 }
@@ -646,51 +670,58 @@ impl App {
     fn on_key_source_select(&mut self, key: KeyEvent) {
         if self.manual_focused {
             match key.code {
-                KeyCode::Esc => {
-                    self.manual_focused = false;
-                }
+                KeyCode::Esc => self.manual_focused = false,
                 KeyCode::Tab => {
                     self.manual_focused = false;
+                    self.source_actions_focused = true;
                 }
                 KeyCode::Enter => {
                     let p = PathBuf::from(self.manual_path.trim());
                     if p.as_os_str().is_empty() {
                         self.status = Some("path is empty".into());
-                        return;
-                    }
-                    if !p.is_dir() {
+                    } else if !p.is_dir() {
                         self.status = Some(format!("not a directory: {}", p.display()));
-                        return;
+                    } else {
+                        self.choose_source(p);
                     }
-                    self.choose_source(p);
                 }
                 KeyCode::Backspace => {
                     self.manual_path.pop();
                 }
-                KeyCode::Char(c) => {
-                    self.manual_path.push(c);
+                KeyCode::Char(c) => self.manual_path.push(c),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.source_actions_focused {
+            match key.code {
+                KeyCode::Esc => self.source_actions_focused = false,
+                KeyCode::Tab => self.source_actions_focused = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.source_action = self.source_action.saturating_sub(1);
                 }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.source_action = (self.source_action + 1).min(2);
+                }
+                KeyCode::Enter => match self.source_action {
+                    0 => self.manual_focused = true,
+                    1 => {
+                        self.mounts = detect_mounts();
+                        self.sources_state
+                            .select((!self.mounts.is_empty()).then_some(0));
+                        self.status = Some("rescanned mounts".into());
+                    }
+                    _ => self.should_quit = true,
+                },
                 _ => {}
             }
             return;
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.should_quit = true;
-            }
-            KeyCode::Char('r') => {
-                self.mounts = detect_mounts();
-                self.sources_state.select(if self.mounts.is_empty() {
-                    None
-                } else {
-                    Some(0)
-                });
-                self.status = Some("rescanned mounts".into());
-            }
-            KeyCode::Char('m') | KeyCode::Tab => {
-                self.manual_focused = true;
-            }
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Tab => self.manual_focused = true,
             KeyCode::Down | KeyCode::Char('j') if !self.mounts.is_empty() => {
                 let i = self.sources_state.selected().unwrap_or(0);
                 self.sources_state.select(Some((i + 1) % self.mounts.len()));
@@ -727,11 +758,12 @@ impl App {
         // If destination roots are missing, force the user to fill them in
         // before showing the Confirm screen.
         if self.cfg.paths.images_root.is_none() || self.cfg.paths.videos_root.is_none() {
-            self.dest_field = if self.cfg.paths.images_root.is_none() {
+            let field = if self.cfg.paths.images_root.is_none() {
                 DestField::ImagesRoot
             } else {
                 DestField::VideosRoot
             };
+            self.select_dest_field(field);
             self.screen = Screen::Destination;
         } else {
             self.screen = Screen::Confirm;
@@ -740,31 +772,35 @@ impl App {
 
     async fn on_key_confirm(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                self.screen = Screen::SourceSelect;
+            KeyCode::Esc => self.screen = Screen::SourceSelect,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.confirm_action = self.confirm_action.saturating_sub(1);
             }
-            KeyCode::Enter => {
-                if self.cfg.filters.raw_mode != self.raw_mode_disk {
-                    self.save_prompt_next = SavePromptNext::StartScan;
-                    self.screen = Screen::SaveConfigPrompt;
-                } else {
-                    self.start_scan();
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.confirm_action = (self.confirm_action + 1).min(3);
+            }
+            KeyCode::Enter => match self.confirm_action {
+                0 => {
+                    if self.cfg.filters.raw_mode != self.raw_mode_disk {
+                        self.save_prompt_next = SavePromptNext::StartScan;
+                        self.screen = Screen::SaveConfigPrompt;
+                    } else {
+                        self.start_scan();
+                    }
                 }
-            }
-            KeyCode::Char('e') => {
-                self.dest_field = DestField::ImagesRoot;
-                self.screen = Screen::Destination;
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                self.cfg.filters.raw_mode = match self.cfg.filters.raw_mode {
-                    RawMode::All => RawMode::RawOnly,
-                    RawMode::RawOnly => RawMode::NonRawOnly,
-                    RawMode::NonRawOnly => RawMode::All,
-                };
-            }
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-            }
+                1 => {
+                    self.select_dest_field(DestField::ImagesRoot);
+                    self.screen = Screen::Destination;
+                }
+                2 => {
+                    self.cfg.filters.raw_mode = match self.cfg.filters.raw_mode {
+                        RawMode::All => RawMode::RawOnly,
+                        RawMode::RawOnly => RawMode::NonRawOnly,
+                        RawMode::NonRawOnly => RawMode::All,
+                    };
+                }
+                _ => self.screen = Screen::SourceSelect,
+            },
             _ => {}
         }
     }
@@ -774,29 +810,21 @@ impl App {
     fn on_key_destination(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                // Back out without applying. If we got here because roots
-                // are missing, return to SourceSelect; otherwise to Confirm.
+                self.reset_destination_buffers();
                 if self.cfg.paths.images_root.is_none() || self.cfg.paths.videos_root.is_none() {
                     self.screen = Screen::SourceSelect;
                 } else {
                     self.screen = Screen::Confirm;
                 }
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.dest_field = self.dest_field.next();
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.dest_field = self.dest_field.prev();
-            }
-            KeyCode::Enter => {
-                self.try_apply_destination();
-            }
-            KeyCode::Backspace => {
-                self.dest_buffer_mut().pop();
-            }
-            KeyCode::Char(c) => {
-                self.dest_buffer_mut().push(c);
-            }
+            KeyCode::Tab | KeyCode::Down => self.select_dest_field(self.dest_field.next()),
+            KeyCode::BackTab | KeyCode::Up => self.select_dest_field(self.dest_field.prev()),
+            KeyCode::Left => self.move_dest_cursor_left(),
+            KeyCode::Right => self.move_dest_cursor_right(),
+            KeyCode::Enter => self.try_apply_destination(),
+            KeyCode::Backspace => self.delete_before_dest_cursor(),
+            KeyCode::Delete => self.delete_at_dest_cursor(),
+            KeyCode::Char(c) => self.insert_at_dest_cursor(c),
             _ => {}
         }
     }
@@ -808,6 +836,77 @@ impl App {
             DestField::ImagesTemplate => &mut self.dest_images_template,
             DestField::VideosTemplate => &mut self.dest_videos_template,
         }
+    }
+
+    fn select_dest_field(&mut self, field: DestField) {
+        self.dest_field = field;
+        self.dest_cursor = self.dest_buffer_mut().len();
+    }
+
+    fn move_dest_cursor_left(&mut self) {
+        let cursor = self.dest_cursor;
+        let next = {
+            let value = self.dest_buffer_mut();
+            value[..cursor].char_indices().last().map_or(0, |(i, _)| i)
+        };
+        self.dest_cursor = next;
+    }
+
+    fn move_dest_cursor_right(&mut self) {
+        let cursor = self.dest_cursor;
+        let next = {
+            let value = self.dest_buffer_mut();
+            if cursor < value.len() {
+                cursor + value[cursor..].chars().next().unwrap().len_utf8()
+            } else {
+                cursor
+            }
+        };
+        self.dest_cursor = next;
+    }
+
+    fn insert_at_dest_cursor(&mut self, c: char) {
+        let cursor = self.dest_cursor;
+        self.dest_buffer_mut().insert(cursor, c);
+        self.dest_cursor += c.len_utf8();
+    }
+
+    fn delete_before_dest_cursor(&mut self) {
+        let cursor = self.dest_cursor;
+        let value = self.dest_buffer_mut();
+        if let Some((start, _)) = value[..cursor].char_indices().last() {
+            value.drain(start..cursor);
+            self.dest_cursor = start;
+        }
+    }
+
+    fn delete_at_dest_cursor(&mut self) {
+        let cursor = self.dest_cursor;
+        let value = self.dest_buffer_mut();
+        if cursor < value.len() {
+            let end = cursor + value[cursor..].chars().next().unwrap().len_utf8();
+            value.drain(cursor..end);
+        }
+    }
+
+    fn reset_destination_buffers(&mut self) {
+        self.dest_images_root = self
+            .cfg
+            .paths
+            .images_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.dest_videos_root = self
+            .cfg
+            .paths
+            .videos_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.dest_images_template = self.cfg.paths.images_template.clone();
+        self.dest_videos_template = self.cfg.paths.videos_template.clone();
+        self.dest_cursor = self.dest_buffer_mut().len();
     }
 
     /// Validate the editor buffers; on success copy them into `self.cfg`
@@ -868,24 +967,27 @@ impl App {
 
     fn on_key_save_prompt(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                match self.cfg.save(&self.cfg_path) {
-                    Ok(()) => {
-                        self.status = Some(format!("saved config to {}", self.cfg_path.display()));
-                        // Update on-disk snapshot so we don't re-prompt.
-                        self.raw_mode_disk = self.cfg.filters.raw_mode;
-                    }
-                    Err(e) => {
-                        self.status = Some(format!("save failed: {e}"));
-                    }
-                }
-                self.finish_save_prompt();
+            KeyCode::Esc => self.screen = Screen::Confirm,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.save_action = self.save_action.saturating_sub(1);
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                // Skip saving; values apply for this session only.
-                self.status = Some("using values for this session only".into());
-                // Treat session-only acceptance as "don't re-prompt this session".
-                self.raw_mode_disk = self.cfg.filters.raw_mode;
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.save_action = (self.save_action + 1).min(1);
+            }
+            KeyCode::Enter => {
+                if self.save_action == 0 {
+                    match self.cfg.save(&self.cfg_path) {
+                        Ok(()) => {
+                            self.status =
+                                Some(format!("saved config to {}", self.cfg_path.display()));
+                            self.raw_mode_disk = self.cfg.filters.raw_mode;
+                        }
+                        Err(e) => self.status = Some(format!("save failed: {e}")),
+                    }
+                } else {
+                    self.status = Some("using values for this session only".into());
+                    self.raw_mode_disk = self.cfg.filters.raw_mode;
+                }
                 self.finish_save_prompt();
             }
             _ => {}
@@ -931,6 +1033,22 @@ impl App {
                 self.plan_source = None;
                 self.screen = Screen::SourceSelect;
             }
+            KeyCode::Tab => self.review_actions_focused = !self.review_actions_focused,
+            KeyCode::Down | KeyCode::Char('j') if self.review_actions_focused => {
+                self.review_action = (self.review_action + 1).min(2);
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.review_actions_focused => {
+                self.review_action = self.review_action.saturating_sub(1);
+            }
+            KeyCode::Enter if self.review_actions_focused => match self.review_action {
+                0 => self.start_sync(false),
+                1 => self.start_sync(true),
+                _ => {
+                    self.plan = None;
+                    self.plan_source = None;
+                    self.screen = Screen::SourceSelect;
+                }
+            },
             KeyCode::Down | KeyCode::Char('j') if n > 0 => {
                 let i = self.review_state.selected().unwrap_or(0);
                 self.review_state.select(Some((i + 1).min(n - 1)));
@@ -946,12 +1064,6 @@ impl App {
             KeyCode::PageUp if n > 0 => {
                 let i = self.review_state.selected().unwrap_or(0);
                 self.review_state.select(Some(i.saturating_sub(10)));
-            }
-            KeyCode::Char('s') => {
-                self.start_sync(false);
-            }
-            KeyCode::Char('d') => {
-                self.start_sync(true);
             }
             _ => {}
         }
@@ -969,13 +1081,20 @@ impl App {
 
     fn on_key_summary(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-                self.should_quit = true;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.summary_action = self.summary_action.saturating_sub(1);
             }
-            KeyCode::Char('n') => {
-                // Start over.
-                self.reset_for_new_run();
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.summary_action = (self.summary_action + 1).min(1);
             }
+            KeyCode::Enter => {
+                if self.summary_action == 0 {
+                    self.reset_for_new_run();
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
     }
@@ -993,6 +1112,7 @@ impl App {
         self.meta_total = 0;
         self.scan_cancelling = false;
         self.sync_progress = SyncSummary::default();
+        self.sync_copy_total = 0;
         self.sync_log.clear();
         self.sync_diagnostics.clear();
         self.sync_slots.clear();
@@ -1065,6 +1185,7 @@ impl App {
         };
 
         self.dry_run = dry_run;
+        self.sync_copy_total = plan.copies();
         self.sync_progress = SyncSummary::default();
         self.sync_log.clear();
         self.sync_diagnostics.clear();
@@ -1158,17 +1279,16 @@ impl App {
             area,
         );
     }
-
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help = match self.screen {
-            Screen::SourceSelect => "↑/↓ pick   Enter select   m manual path   r rescan   q quit",
+            Screen::SourceSelect => "Tab switch focus   ↑/↓ select   Enter activate   Esc quit",
             Screen::Destination => "Tab/↑↓ field   Enter accept   Esc cancel",
-            Screen::SaveConfigPrompt => "y save   n / Enter session-only   Esc cancel",
-            Screen::Confirm => "Enter scan   e edit destinations   r raw mode   Esc back   q quit",
+            Screen::SaveConfigPrompt => "↑/↓ select action   Enter activate   Esc cancel",
+            Screen::Confirm => "↑/↓ select action   Enter activate   Esc back   q quit",
             Screen::Scan => "Esc cancel",
-            Screen::Review => "↑/↓ scroll   s sync   d dry-run   Esc back   q quit",
+            Screen::Review => "Tab switch focus   ↑/↓ select or scroll   Enter activate   Esc back",
             Screen::Sync => "Esc abort",
-            Screen::Summary => "n new run   Enter/q quit",
+            Screen::Summary => "↑/↓ select action   Enter activate   Esc quit",
         };
         f.render_widget(
             Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1181,7 +1301,11 @@ impl App {
     fn render_source_select(&mut self, f: &mut Frame, area: Rect) {
         let cols = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(3),
+                Constraint::Length(5),
+            ])
             .split(area);
 
         // List
@@ -1234,11 +1358,10 @@ impl App {
             .highlight_symbol("▶ ");
         f.render_stateful_widget(list, cols[0], &mut self.sources_state);
 
-        // Manual path input
         let title = if self.manual_focused {
-            " manual path (Enter to accept, Esc to cancel) "
+            " manual path (Enter to accept, Tab actions) "
         } else {
-            " manual path (press m or Tab to edit) "
+            " manual path (Tab to edit) "
         };
         let style = if self.manual_focused {
             Style::default().fg(Color::Yellow)
@@ -1254,6 +1377,26 @@ impl App {
             .style(style)
             .block(Block::default().borders(Borders::ALL).title(title));
         f.render_widget(para, cols[1]);
+
+        let actions = vec![
+            action_line(
+                self.source_actions_focused && self.source_action == 0,
+                "Enter a path manually",
+            ),
+            action_line(
+                self.source_actions_focused && self.source_action == 1,
+                "Refresh sources",
+            ),
+            action_line(
+                self.source_actions_focused && self.source_action == 2,
+                "Quit",
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(actions)
+                .block(Block::default().borders(Borders::ALL).title(" actions ")),
+            cols[2],
+        );
     }
 
     // ------- Screen: Destination -------
@@ -1328,7 +1471,8 @@ impl App {
             Style::default().fg(Color::Gray)
         };
         let display = if focused {
-            format!("{value}_")
+            let cursor = self.dest_cursor.min(value.len());
+            format!("{}_{}", &value[..cursor], &value[cursor..])
         } else {
             value.to_string()
         };
@@ -1391,10 +1535,8 @@ impl App {
         ];
         body.extend(body_lines);
         body.push(Line::raw(""));
-        body.push(Line::from(Span::styled(
-            "  [y] save to config        [n] use this session only        [Esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
+        body.push(action_line(self.save_action == 0, "Save to config"));
+        body.push(action_line(self.save_action == 1, "Use this session only"));
         f.render_widget(
             Paragraph::new(body)
                 .block(Block::default().borders(Borders::ALL).title(title))
@@ -1448,15 +1590,21 @@ impl App {
                 Span::styled("Raw mode: ", Style::default().fg(Color::Cyan)),
                 Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
                 Span::styled(
-                    "   (press r to cycle)",
+                    "   (select the action below to change)",
                     Style::default().fg(Color::DarkGray),
                 ),
             ]),
             Line::raw(""),
-            Line::from(Span::styled(
-                "Press Enter to scan and build a plan. Nothing is copied yet.",
-                Style::default().fg(Color::Yellow),
-            )),
+            action_line(self.confirm_action == 0, "Scan and review"),
+            action_line(self.confirm_action == 1, "Edit destinations"),
+            action_line(
+                self.confirm_action == 2,
+                &format!(
+                    "Change RAW mode ({})",
+                    raw_mode_label(self.cfg.filters.raw_mode)
+                ),
+            ),
+            action_line(self.confirm_action == 3, "Back"),
         ];
         let para = Paragraph::new(body)
             .block(Block::default().borders(Borders::ALL).title(" confirm "))
@@ -1517,13 +1665,45 @@ impl App {
 
     fn render_review(&mut self, f: &mut Frame, area: Rect) {
         let rows = Layout::default()
-            .constraints([Constraint::Length(5), Constraint::Min(3)])
+            .constraints([Constraint::Length(7), Constraint::Min(3)])
             .split(area);
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(32), Constraint::Min(20)])
+            .split(rows[0]);
 
         let plan = match &self.plan {
             Some(p) => p,
             None => return,
         };
+        let action_border = if self.review_actions_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let actions = vec![
+            action_line(
+                self.review_actions_focused && self.review_action == 0,
+                "Start import",
+            ),
+            action_line(
+                self.review_actions_focused && self.review_action == 1,
+                "Dry run",
+            ),
+            action_line(
+                self.review_actions_focused && self.review_action == 2,
+                "Back",
+            ),
+        ];
+        f.render_widget(
+            Paragraph::new(actions).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" actions ")
+                    .border_style(action_border),
+            ),
+            top[0],
+        );
 
         let summary = vec![
             Line::from(vec![
@@ -1538,28 +1718,56 @@ impl App {
             ]),
             Line::raw(""),
             Line::from(Span::styled(
-                "Destination folders are resolved during import; this is a provisional source-file list.",
+                "Destination folders resolve during import; this is a provisional source-file list.",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                "Press 's' to copy, 'd' to dry-run, Esc to back out.",
-                Style::default().fg(Color::Yellow),
+                "Tab switches between actions and preview.",
+                Style::default().fg(Color::DarkGray),
             )),
         ];
         f.render_widget(
-            Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(" plan ")),
-            rows[0],
+            Paragraph::new(summary).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" plan ")
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            top[1],
         );
 
         let items = build_review_tree(plan);
-
+        let item_count = items.len();
+        let preview_border = if self.review_actions_focused {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " provisional preview ({} new files) ",
-                plan.copies()
-            )))
-            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(
+                        " provisional preview ({} new files) ",
+                        plan.copies()
+                    ))
+                    .border_style(preview_border),
+            )
+            .highlight_style(if self.review_actions_focused {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            });
         f.render_stateful_widget(list, rows[1], &mut self.review_state);
+        if item_count > rows[1].height.saturating_sub(2) as usize {
+            let mut scrollbar_state =
+                ScrollbarState::new(item_count).position(self.review_state.selected().unwrap_or(0));
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                rows[1],
+                &mut scrollbar_state,
+            );
+        }
     }
 
     // ------- Screen: Sync -------
@@ -1584,18 +1792,17 @@ impl App {
             .constraints(constraints)
             .split(area);
 
-        // ExecutionProgress is the source of truth: skipped files count as
-        // completed too, so the gauge advances even when no bytes are copied.
-        let completed = self.sync_progress.completed();
-        let pct = if self.sync_progress.total > 0 {
-            (completed as f64 / self.sync_progress.total as f64).min(1.0)
+        // Progress tracks files that required import work. Runtime skips are
+        // reported separately and never make the import bar appear complete.
+        let completed = self.sync_progress.copied + self.sync_progress.failed;
+        let pct = if self.sync_copy_total > 0 {
+            (completed as f64 / self.sync_copy_total as f64).min(1.0)
         } else {
             1.0
         };
         let mut total_label = format!(
-            "{}/{} complete · {} copied · {} failed · {} skipped",
-            completed,
-            self.sync_progress.total,
+            "{completed}/{} imported · {} copied · {} failed · {} skipped",
+            self.sync_copy_total,
             self.sync_progress.copied,
             self.sync_progress.failed,
             self.sync_progress.skipped
@@ -1730,6 +1937,12 @@ impl App {
                     .map(|diagnostic| Line::raw(diagnostic.clone())),
             );
         }
+        body.push(Line::raw(""));
+        body.push(action_line(
+            self.summary_action == 0,
+            "Import another source",
+        ));
+        body.push(action_line(self.summary_action == 1, "Quit"));
         f.render_widget(
             Paragraph::new(body)
                 .block(Block::default().borders(Borders::ALL).title(" done "))
@@ -1784,6 +1997,16 @@ fn trim_label(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+fn action_line(selected: bool, label: &str) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let style = if selected {
+        Style::default().bg(Color::Blue).fg(Color::White)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(format!("{marker}{label}"), style))
 }
 
 fn raw_mode_label(m: RawMode) -> &'static str {
@@ -1879,12 +2102,11 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
         ));
         out.push(ListItem::new(Line::from(spans)));
 
-        // Sample filenames (top 3 by source basename, alphabetical).
+        // Preserve every filename; the viewport scrolls when the terminal
+        // cannot display the complete plan.
         let mut sorted = files.clone();
         sorted.sort_by(|a, b| basename_of(&a.source_rel_path).cmp(basename_of(&b.source_rel_path)));
-        let total = sorted.len();
-        let show = total.min(3);
-        for f in &sorted[..show] {
+        for f in &sorted {
             let name = basename_of(&f.source_rel_path).to_string();
             let kind_tag = match f.kind {
                 MediaKindWire::RawImage => Span::styled("RAW", Style::default().fg(Color::Magenta)),
@@ -1899,15 +2121,6 @@ fn build_review_tree(plan: &SyncPlan) -> Vec<ListItem<'static>> {
                 kind_tag,
                 Span::raw("  "),
                 Span::raw(name),
-            ])));
-        }
-        if total > show {
-            out.push(ListItem::new(Line::from(vec![
-                Span::raw("    └─ "),
-                Span::styled(
-                    format!("(... {} more)", total - show),
-                    Style::default().fg(Color::DarkGray),
-                ),
             ])));
         }
         // Blank spacer between groups.
