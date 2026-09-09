@@ -36,11 +36,13 @@ enum Command {
     Scan(ScanArgs),
     /// Sync (copy) files from source to configured destinations.
     Sync(SyncArgs),
+    /// List configured import catalogues.
+    Catalogues,
     /// List loaded camera profiles.
     Profiles,
     /// List detected mountable sources (SD cards, removable drives).
     Sources,
-    /// Print the resolved config (after applying any flags) and exit.
+    /// Print the serialized runtime config and exit.
     Config,
 }
 
@@ -57,21 +59,9 @@ struct CommonOpts {
     #[arg(value_name = "SOURCE")]
     source: PathBuf,
 
-    /// Destination root for images. Overrides config.
+    /// Saved catalogue to use for destination routing.
     #[arg(long)]
-    images_root: Option<PathBuf>,
-
-    /// Destination root for videos. Overrides config.
-    #[arg(long)]
-    videos_root: Option<PathBuf>,
-
-    /// Path template for images (e.g. `{yyyy}/{yyyy}-{mm}-{dd}`).
-    #[arg(long)]
-    images_template: Option<String>,
-
-    /// Path template for videos (e.g. `{yyyy}/{mm}/{dd}`).
-    #[arg(long)]
-    videos_template: Option<String>,
+    catalogue: String,
 
     /// Filter: `all` | `raw_only` | `non_raw_only`.
     #[arg(long)]
@@ -141,6 +131,7 @@ async fn main() -> Result<()> {
         Command::Tui(args) => run_tui(cli.config.clone(), args).await,
         Command::Scan(args) => run_scan_or_sync(&cli, args.common, true, false).await,
         Command::Sync(args) => run_scan_or_sync(&cli, args.common, false, args.dry_run).await,
+        Command::Catalogues => run_catalogues(&cli),
         Command::Profiles => run_profiles(),
         Command::Sources => run_sources(),
         Command::Config => run_config(&cli),
@@ -187,18 +178,6 @@ fn load_app_config(cli: &Cli) -> Result<(AppConfig, PathBuf)> {
 }
 
 fn apply_overrides(mut cfg: AppConfig, opts: &CommonOpts) -> AppConfig {
-    if let Some(p) = &opts.images_root {
-        cfg.paths.images_root = Some(p.clone());
-    }
-    if let Some(p) = &opts.videos_root {
-        cfg.paths.videos_root = Some(p.clone());
-    }
-    if let Some(t) = &opts.images_template {
-        cfg.paths.images_template = t.clone();
-    }
-    if let Some(t) = &opts.videos_template {
-        cfg.paths.videos_template = t.clone();
-    }
     if let Some(m) = &opts.raw_mode {
         cfg.filters.raw_mode = m.clone().into();
     }
@@ -223,7 +202,10 @@ async fn run_scan_or_sync(
     scan_only: bool,
     dry_run: bool,
 ) -> Result<()> {
-    // Probe exiftool early.
+    let (app_cfg, _path) = load_app_config(cli)?;
+    let app_cfg = apply_overrides(app_cfg, &opts);
+    let engine_cfg = EngineConfig::try_from_catalogue(&app_cfg, &opts.catalogue)?;
+
     match imagesync_core::exiftool::probe_version() {
         Ok(v) => tracing::info!("exiftool version {v}"),
         Err(e) => {
@@ -232,13 +214,6 @@ async fn run_scan_or_sync(
             );
         }
     }
-
-    let (app_cfg, _path) = load_app_config(cli)?;
-    let app_cfg = apply_overrides(app_cfg, &opts);
-
-    let engine_cfg = EngineConfig::try_from_app(&app_cfg).context(
-        "incomplete configuration (set images_root and videos_root via flags or config file)",
-    )?;
 
     let registry = ProfileRegistry::with_builtins()?;
 
@@ -509,6 +484,26 @@ fn run_sources() -> Result<()> {
             imagesync_core::mount::MountRank::Other => "[other ]",
         };
         println!("  {tag} {:<24} {}", m.label, m.path.display());
+    }
+    Ok(())
+}
+
+fn run_catalogues(cli: &Cli) -> Result<()> {
+    let (cfg, _) = load_app_config(cli)?;
+    if cfg.catalogues.is_empty() {
+        println!("No catalogues configured.");
+        return Ok(());
+    }
+
+    for (index, (name, catalogue)) in cfg.catalogues.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("{name}");
+        println!("  images root: {}", catalogue.images_root.display());
+        println!("  images folders: {}", catalogue.images_template);
+        println!("  videos root: {}", catalogue.videos_root.display());
+        println!("  videos folders: {}", catalogue.videos_template);
     }
     Ok(())
 }

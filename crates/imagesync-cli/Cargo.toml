@@ -29,3 +29,6 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 directories.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

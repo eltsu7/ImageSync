@@ -124,9 +124,8 @@ impl ProfileRegistry {
     }
 
     fn add_builtin(&mut self, src: &str) -> Result<()> {
-        let p = CameraProfile::from_toml_str(src).map_err(|e| {
-            Error::Profile(format!("failed to parse builtin profile: {e}"))
-        })?;
+        let p = CameraProfile::from_toml_str(src)
+            .map_err(|e| Error::Profile(format!("failed to parse builtin profile: {e}")))?;
         self.insert(p);
         Ok(())
     }

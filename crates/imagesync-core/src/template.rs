@@ -133,7 +133,9 @@ impl PathTemplate {
                 '}' => {
                     return Err(Error::Template {
                         template: template.to_string(),
-                        message: "stray `}` (escape literal `}` is not supported; just don't use it)".into(),
+                        message:
+                            "stray `}` (escape literal `}` is not supported; just don't use it)"
+                                .into(),
                     });
                 }
                 _ => buf.push(c),

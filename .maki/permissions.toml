@@ -1,0 +1,4 @@
+[bash]
+allow = [
+    "target/release/imagesync *",
+]

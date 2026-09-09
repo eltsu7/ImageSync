@@ -164,7 +164,9 @@ impl ExifTool {
                 .await
                 .map_err(|e| Error::Exiftool(format!("read line: {e}")))?;
             if n == 0 {
-                return Err(Error::Exiftool("exiftool stdout closed unexpectedly".into()));
+                return Err(Error::Exiftool(
+                    "exiftool stdout closed unexpectedly".into(),
+                ));
             }
             let trimmed = line.trim_end();
             if trimmed == ready_marker {

@@ -41,13 +41,20 @@ pub enum MountRank {
 
 /// Detect candidate mounts on the current platform. Never errors — on any
 /// I/O hiccup we just return what we have.
+///
+/// `IMAGESYNC_MOUNT_ROOT` replaces platform discovery with the immediate
+/// child directories of the configured path. This supports deterministic
+/// development fixtures without creating real mounts.
 pub fn detect_mounts() -> Vec<DetectedMount> {
-    let mut out = platform_detect();
+    let mut out = match std::env::var_os("IMAGESYNC_MOUNT_ROOT") {
+        Some(root) if !root.is_empty() => mounts_in_roots([PathBuf::from(root)], None),
+        _ => platform_detect(),
+    };
 
     // Filter clearly bogus entries (non-existent paths, the system root).
     out.retain(|m| m.path.exists() && !is_system_root(&m.path));
 
-    // Score: presence of DCIM bumps to CameraCard.
+    // Score: presence of DCIM bumps it to CameraCard.
     for m in &mut out {
         if m.rank != MountRank::CameraCard && looks_like_camera_card(&m.path) {
             m.rank = MountRank::CameraCard;
@@ -63,6 +70,36 @@ pub fn detect_mounts() -> Vec<DetectedMount> {
     out
 }
 
+fn mounts_in_roots(
+    roots: impl IntoIterator<Item = PathBuf>,
+    wrapper_name: Option<&str>,
+) -> Vec<DetectedMount> {
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let label = entry.file_name().to_string_lossy().to_string();
+            if wrapper_name == Some(label.as_str())
+                && (root == Path::new("/media") || root == Path::new("/run/media"))
+            {
+                continue;
+            }
+            out.push(DetectedMount {
+                path,
+                label,
+                rank: MountRank::Removable,
+            });
+        }
+    }
+    out
+}
+
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -74,45 +111,27 @@ fn is_system_root(p: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn platform_detect() -> Vec<DetectedMount> {
-    let mut out = Vec::new();
-    let user = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).ok();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok();
 
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(u) = &user {
-        roots.push(PathBuf::from(format!("/run/media/{u}")));
-        roots.push(PathBuf::from(format!("/media/{u}")));
+    if let Some(user) = &user {
+        roots.push(PathBuf::from(format!("/run/media/{user}")));
+        roots.push(PathBuf::from(format!("/media/{user}")));
     }
     roots.push(PathBuf::from("/media"));
     roots.push(PathBuf::from("/mnt"));
 
-    for r in roots {
-        let Ok(rd) = std::fs::read_dir(&r) else { continue };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            // Skip files and the per-user dirs we already enumerated.
-            if !path.is_dir() {
-                continue;
-            }
-            let label = entry.file_name().to_string_lossy().to_string();
-            // Skip the per-user wrapper dirs themselves (e.g. /media/eeli).
-            if Some(&label) == user.as_ref() && (r == Path::new("/media") || r == Path::new("/run/media")) {
-                continue;
-            }
-            out.push(DetectedMount {
-                path,
-                label,
-                rank: MountRank::Removable,
-            });
-        }
-    }
-
-    out
+    mounts_in_roots(roots, user.as_deref())
 }
 
 #[cfg(target_os = "macos")]
 fn platform_detect() -> Vec<DetectedMount> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/Volumes") else { return out };
+    let Ok(rd) = std::fs::read_dir("/Volumes") else {
+        return out;
+    };
     // Resolve boot volume so we can skip it.
     let boot = std::fs::canonicalize("/").ok();
     for entry in rd.flatten() {
@@ -183,5 +202,29 @@ mod tests {
     #[test]
     fn detect_does_not_panic() {
         let _ = detect_mounts();
+    }
+
+    #[test]
+    fn custom_mount_root_discovers_camera_shaped_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let camera = temp.path().join("Test Camera");
+        std::fs::create_dir_all(camera.join("DCIM")).unwrap();
+        std::fs::write(temp.path().join("not-a-device"), "x").unwrap();
+
+        let mut mounts = mounts_in_roots([temp.path().to_path_buf()], None);
+        for mount in &mut mounts {
+            if looks_like_camera_card(&mount.path) {
+                mount.rank = MountRank::CameraCard;
+            }
+        }
+
+        assert_eq!(
+            mounts,
+            [DetectedMount {
+                path: camera,
+                label: "Test Camera".into(),
+                rank: MountRank::CameraCard,
+            }]
+        );
     }
 }

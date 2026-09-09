@@ -40,10 +40,7 @@ pub struct ResolvedMetadata {
     pub model: Option<String>,
 }
 
-pub fn resolve_one(
-    file: &SourceFile,
-    exif: &FileMetadata,
-) -> Option<ResolvedMetadata> {
+pub fn resolve_one(file: &SourceFile, exif: &FileMetadata) -> Option<ResolvedMetadata> {
     if let Some(dt) = exif.date_time_original {
         return Some(ResolvedMetadata {
             datetime: dt,

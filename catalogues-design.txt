@@ -1,0 +1,156 @@
+ImageSync catalogue design
+==========================
+
+Purpose
+-------
+A catalogue is a named destination-routing preset, not a media database and not a persistent file index.
+
+A catalogue owns:
+- Image destination root
+- Video destination root
+- Image folder template
+- Video folder template
+
+These remain global rather than catalogue-specific:
+- Filters
+- Verification settings
+- Copy-worker/performance settings
+- Camera profiles
+
+Configuration shape
+-------------------
+Example:
+
+[catalogues.photos]
+images_root = "/media/photos"
+videos_root = "/media/videos"
+images_template = "{yyyy}/{yyyy}-{mm}-{dd}"
+videos_template = "{yyyy}/{yyyy}-{mm}-{dd}"
+
+[catalogues.film-scans]
+images_root = "/media/film"
+videos_root = "/media/film-video"
+images_template = "{yyyy}/{yyyy}-{mm}-{dd}"
+videos_template = "{yyyy}/{yyyy}-{mm}-{dd}"
+
+TUI flow
+--------
+Recommended startup sequence:
+
+1. Catalogue selection
+2. Source selection
+3. Confirmation
+4. Scan
+5. Provisional review
+6. Import
+7. Summary
+
+Catalogue selection example:
+
+> Photos
+  Film scans
+  Create new catalogue
+
+The chosen catalogue must remain visible on confirmation and other relevant screens so the user can audit where the import will go before any files are written.
+
+Creating/editing a catalogue
+----------------------------
+The catalogue editor replaces the current generic destination editor for persistent routing configuration.
+
+Fields:
+1. Catalogue name
+2. Images root
+3. Videos root
+4. Images folder template
+5. Videos folder template
+
+Requirements:
+- Catalogue name is non-empty and unique.
+- Both roots must be present.
+- Both templates must parse.
+- Saving is explicit; cancelling restores the prior values.
+- Existing catalogue names cannot be silently overwritten.
+
+Engine/config boundary
+----------------------
+The core import engine does not need to know a catalogue name. Construct EngineConfig from the selected catalogue plus global settings. This keeps scanning, planning, destination locking, dedupe, and copying unchanged.
+
+Conceptually:
+
+EngineConfig::try_from_catalogue(&app_config, catalogue_name)
+
+The selected catalogue naturally scopes destination locking and dedupe through its configured roots. Catalogues with overlapping roots are allowed but may produce cross-catalogue pre-skips; the UI should make roots visible rather than silently hiding this consequence.
+
+Migration from legacy [paths]
+-----------------------------
+1. If [catalogues] exists, use it.
+2. Otherwise, if legacy [paths] has configured roots, expose it in memory as a catalogue named "default".
+3. Do not immediately rewrite the user's config during load.
+4. Persist the new [catalogues.default] representation only after a deliberate save/edit action.
+5. Do not keep [paths] and [catalogues] as two runtime sources of truth.
+
+Likely serialization detail: retain a legacy Paths field only for deserialization/migration, then normalize immediately into the catalogue map.
+
+Selection behavior
+------------------
+Selection must be deterministic:
+- One configured catalogue: select it automatically, while keeping its name visible.
+- Multiple catalogues: open the catalogue-selection screen.
+- No catalogues: open catalogue creation.
+- Remembering the last catalogue may be added later, but must not obscure the selected routing destination.
+- Unknown catalogue names are errors; never silently fall back to another catalogue.
+
+CLI design
+----------
+Examples:
+
+imagesync sync --catalogue photos /media/card
+imagesync scan --catalogue film-scans /media/card
+imagesync catalogues
+
+Suggested behavior:
+- --catalogue selects a configured catalogue.
+- A missing name fails and lists available catalogue names.
+- Existing explicit root/template flags remain session-only overrides layered over the selected catalogue.
+- If all required destinations are supplied explicitly, an ephemeral run without a saved catalogue may remain possible.
+
+Clean implementation direction
+------------------------------
+Core configuration:
+- Replace the single AppConfig.paths runtime model with a map of named CatalogueConfig values.
+- Add lookup/validation helpers.
+- Build EngineConfig from a selected catalogue plus global configuration.
+
+TUI:
+- Add CatalogueSelect as the startup screen when needed.
+- Store the selected catalogue key in App state.
+- Add catalogue create/edit flow.
+- Return to catalogue selection after "Import another source" unless product behavior later chooses to retain the current catalogue.
+
+CLI:
+- Add --catalogue to scan/sync.
+- Add a command that lists catalogues.
+- Preserve explicit path/template overrides where currently supported.
+
+Tests needed
+------------
+- Parsing multiple catalogues.
+- Duplicate/invalid/empty catalogue names and missing roots.
+- Legacy [paths] migration into an in-memory default catalogue.
+- No automatic config rewrite on load.
+- Deterministic one/many/none selection behavior.
+- Unknown CLI catalogue failure.
+- EngineConfig uses the selected catalogue's roots/templates and global filters/performance/verification.
+- TUI cancellation does not persist edited catalogue values.
+
+Explicit non-goals
+------------------
+- No media database.
+- No persistent imported-file catalogue/index.
+- No catalogue-specific camera profiles.
+- No catalogue-specific filters, verification, or worker settings initially.
+- No project/roll semantic template tokens as part of this change; the current template engine remains date/time based.
+
+Status
+------
+This design was discussed but not implemented. The GUI-ready operation/event refactor and TUI UX work were completed first.

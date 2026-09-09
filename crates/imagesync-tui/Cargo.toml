@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "ratatui frontend for imagesync (M3 — not yet implemented)."
+description = "Ratatui frontend for interactive ImageSync imports."
 
 [dependencies]
 imagesync-core = { path = "../imagesync-core" }
@@ -17,3 +17,6 @@ tokio-stream.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

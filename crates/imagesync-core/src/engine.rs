@@ -1388,7 +1388,7 @@ fn sweep_staging(dir: &std::path::Path) {
 /// paths and non-directories (e.g. a regular file at that path) are
 /// rejected. Catches the "drive not mounted" footgun where every source
 /// file would otherwise be misclassified as new.
-fn check_dest_root(path: &std::path::Path, kind: &'static str) -> Result<()> {
+pub(crate) fn check_dest_root(path: &std::path::Path, kind: &'static str) -> Result<()> {
     match std::fs::metadata(path) {
         Ok(m) if m.is_dir() => Ok(()),
         Ok(_) => Err(crate::error::Error::DestRootNotDir {
