@@ -32,8 +32,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use tokio_stream::wrappers::ReceiverStream;
@@ -103,32 +103,50 @@ enum Screen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CatalogueField {
+enum CatalogueCreateItem {
     Name,
     ImagesRoot,
     VideosRoot,
     ImagesTemplate,
     VideosTemplate,
+    Create,
+    Back,
 }
 
-impl CatalogueField {
+impl CatalogueCreateItem {
     fn next(self) -> Self {
         match self {
-            CatalogueField::Name => CatalogueField::ImagesRoot,
-            CatalogueField::ImagesRoot => CatalogueField::VideosRoot,
-            CatalogueField::VideosRoot => CatalogueField::ImagesTemplate,
-            CatalogueField::ImagesTemplate => CatalogueField::VideosTemplate,
-            CatalogueField::VideosTemplate => CatalogueField::Name,
+            Self::Name => Self::ImagesRoot,
+            Self::ImagesRoot => Self::VideosRoot,
+            Self::VideosRoot => Self::ImagesTemplate,
+            Self::ImagesTemplate => Self::VideosTemplate,
+            Self::VideosTemplate => Self::Create,
+            Self::Create => Self::Back,
+            Self::Back => Self::Back,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            CatalogueField::Name => CatalogueField::VideosTemplate,
-            CatalogueField::ImagesRoot => CatalogueField::Name,
-            CatalogueField::VideosRoot => CatalogueField::ImagesRoot,
-            CatalogueField::ImagesTemplate => CatalogueField::VideosRoot,
-            CatalogueField::VideosTemplate => CatalogueField::ImagesTemplate,
+            Self::Name => Self::Name,
+            Self::ImagesRoot => Self::Name,
+            Self::VideosRoot => Self::ImagesRoot,
+            Self::ImagesTemplate => Self::VideosRoot,
+            Self::VideosTemplate => Self::ImagesTemplate,
+            Self::Create => Self::VideosTemplate,
+            Self::Back => Self::Create,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Name => 0,
+            Self::ImagesRoot => 1,
+            Self::VideosRoot => 2,
+            Self::ImagesTemplate => 3,
+            Self::VideosTemplate => 4,
+            Self::Create => 5,
+            Self::Back => 6,
         }
     }
 }
@@ -162,26 +180,23 @@ struct App {
 
     // SourceSelect
     mounts: Vec<DetectedMount>,
-    sources_state: ListState,
+    source_selection: usize,
     manual_path: String,
-    manual_focused: bool,
-    source_action: usize,
-    source_actions_focused: bool,
+    manual_editing: bool,
 
     // Catalogue selection and creation
-    catalogue_list_state: ListState,
+    catalogue_selection: usize,
     selected_catalogue: Option<String>,
     catalogue_name: String,
     catalogue_images_root: String,
     catalogue_videos_root: String,
     catalogue_images_template: String,
     catalogue_videos_template: String,
-    catalogue_field: CatalogueField,
+    catalogue_create_item: CatalogueCreateItem,
     catalogue_cursor: usize,
     confirm_action: usize,
     save_action: usize,
     review_action: usize,
-    review_actions_focused: bool,
     summary_action: usize,
 
     // Filters (raw_mode picker on Confirm)
@@ -237,12 +252,6 @@ struct App {
 impl App {
     fn new(cfg: AppConfig, cfg_path: PathBuf, registry: ProfileRegistry) -> Self {
         let mounts = detect_mounts();
-        let mut sources_state = ListState::default();
-        if !mounts.is_empty() {
-            sources_state.select(Some(0));
-        }
-        let mut catalogue_list_state = ListState::default();
-        catalogue_list_state.select(Some(0));
         let raw_mode_disk = cfg.filters.raw_mode;
         Self {
             cfg,
@@ -252,25 +261,22 @@ impl App {
             should_quit: false,
             status: None,
             mounts,
-            sources_state,
+            source_selection: 0,
             manual_path: String::new(),
-            manual_focused: false,
-            source_action: 0,
-            source_actions_focused: false,
-            catalogue_list_state,
+            manual_editing: false,
+            catalogue_selection: 0,
             selected_catalogue: None,
             catalogue_name: String::new(),
             catalogue_images_root: String::new(),
             catalogue_videos_root: String::new(),
             catalogue_images_template: "{yyyy}/{yyyy}-{mm}-{dd}".into(),
             catalogue_videos_template: "{yyyy}/{yyyy}-{mm}-{dd}".into(),
-            catalogue_field: CatalogueField::Name,
+            catalogue_create_item: CatalogueCreateItem::Name,
             catalogue_cursor: 0,
             confirm_action: 0,
             save_action: 0,
             review_action: 0,
-            review_actions_focused: false,
-            summary_action: 0,
+            summary_action: 1,
             raw_mode_disk,
             chosen_source: None,
             chosen_label: None,
@@ -400,7 +406,7 @@ impl App {
                         self.plan = Some(plan);
                         self.detected_profile_name = Some(profile.display_name);
                         self.review_state.select(Some(0));
-                        self.review_actions_focused = true;
+                        self.review_action = 0;
                         self.screen = Screen::Review;
                     }
                 }
@@ -442,6 +448,7 @@ impl App {
                     self.sync_error = Some(message);
                 }
             }
+            self.summary_action = 1;
             self.screen = Screen::Summary;
         }
     }
@@ -655,76 +662,52 @@ impl App {
     }
 
     fn on_key_source_select(&mut self, key: KeyEvent) {
-        if self.manual_focused {
+        if self.manual_editing {
             match key.code {
-                KeyCode::Esc => self.manual_focused = false,
-                KeyCode::Tab => {
-                    self.manual_focused = false;
-                    self.source_actions_focused = true;
-                }
+                KeyCode::Esc => self.manual_editing = false,
                 KeyCode::Enter => {
-                    let p = PathBuf::from(self.manual_path.trim());
-                    if p.as_os_str().is_empty() {
+                    let path = PathBuf::from(self.manual_path.trim());
+                    if path.as_os_str().is_empty() {
                         self.status = Some("path is empty".into());
-                    } else if !p.is_dir() {
-                        self.status = Some(format!("not a directory: {}", p.display()));
+                    } else if !path.is_dir() {
+                        self.status = Some(format!("not a directory: {}", path.display()));
                     } else {
-                        self.choose_source(p);
+                        self.choose_source(path);
                     }
                 }
                 KeyCode::Backspace => {
                     self.manual_path.pop();
                 }
-                KeyCode::Char(c) => self.manual_path.push(c),
+                KeyCode::Char(character) => self.manual_path.push(character),
                 _ => {}
             }
             return;
         }
 
-        if self.source_actions_focused {
-            match key.code {
-                KeyCode::Esc => self.source_actions_focused = false,
-                KeyCode::Tab => self.source_actions_focused = false,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.source_action = self.source_action.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.source_action = (self.source_action + 1).min(2);
-                }
-                KeyCode::Enter => match self.source_action {
-                    0 => self.manual_focused = true,
-                    1 => {
-                        self.mounts = detect_mounts();
-                        self.sources_state
-                            .select((!self.mounts.is_empty()).then_some(0));
-                        self.status = Some("rescanned mounts".into());
-                    }
-                    _ => self.should_quit = true,
-                },
-                _ => {}
-            }
-            return;
-        }
-
+        let manual_index = self.mounts.len();
+        let refresh_index = manual_index + 1;
+        let quit_index = manual_index + 2;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Tab => self.manual_focused = true,
-            KeyCode::Down | KeyCode::Char('j') if !self.mounts.is_empty() => {
-                let i = self.sources_state.selected().unwrap_or(0);
-                self.sources_state.select(Some((i + 1) % self.mounts.len()));
+            KeyCode::Up => self.source_selection = self.source_selection.saturating_sub(1),
+            KeyCode::Down => {
+                self.source_selection = (self.source_selection + 1).min(quit_index);
             }
-            KeyCode::Up | KeyCode::Char('k') if !self.mounts.is_empty() => {
-                let i = self.sources_state.selected().unwrap_or(0);
-                self.sources_state
-                    .select(Some(if i == 0 { self.mounts.len() - 1 } else { i - 1 }));
-            }
-            KeyCode::Enter => {
-                if let Some(i) = self.sources_state.selected() {
-                    if let Some(m) = self.mounts.get(i).cloned() {
-                        self.choose_source(m.path);
-                    }
+            KeyCode::Enter if self.source_selection < self.mounts.len() => {
+                if let Some(mount) = self.mounts.get(self.source_selection).cloned() {
+                    self.choose_source(mount.path);
                 }
             }
+            KeyCode::Enter if self.source_selection == manual_index => {
+                self.manual_editing = true;
+                self.status = None;
+            }
+            KeyCode::Enter if self.source_selection == refresh_index => {
+                self.mounts = detect_mounts();
+                self.source_selection = self.mounts.len() + 1;
+                self.status = Some("rescanned mounts".into());
+            }
+            KeyCode::Enter => self.should_quit = true,
             _ => {}
         }
     }
@@ -739,70 +722,72 @@ impl App {
         self.chosen_label = Some(label);
         self.chosen_source = Some(path);
         self.selected_catalogue = None;
-        self.catalogue_list_state.select(Some(0));
+        self.catalogue_selection = 0;
         self.status = None;
+        self.manual_editing = false;
         self.screen = Screen::CatalogueSelect;
     }
 
     fn on_key_catalogue_select(&mut self, key: KeyEvent) {
-        let item_count = self.cfg.catalogues.len() + 1;
+        let create_index = self.cfg.catalogues.len();
+        let back_index = create_index + 1;
         match key.code {
             KeyCode::Esc => self.screen = Screen::SourceSelect,
-            KeyCode::Down | KeyCode::Char('j') => {
-                let index = self.catalogue_list_state.selected().unwrap_or(0);
-                self.catalogue_list_state
-                    .select(Some((index + 1) % item_count));
+            KeyCode::Up => {
+                self.catalogue_selection = self.catalogue_selection.saturating_sub(1);
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let index = self.catalogue_list_state.selected().unwrap_or(0);
-                self.catalogue_list_state.select(Some(if index == 0 {
-                    item_count - 1
-                } else {
-                    index - 1
-                }));
+            KeyCode::Down => {
+                self.catalogue_selection = (self.catalogue_selection + 1).min(back_index);
             }
-            KeyCode::Enter => {
-                let index = self.catalogue_list_state.selected().unwrap_or(0);
-                if index == self.cfg.catalogues.len() {
-                    self.reset_catalogue_form();
-                    self.screen = Screen::CatalogueCreate;
-                } else if let Some(name) = self.cfg.catalogues.keys().nth(index).cloned() {
+            KeyCode::Enter if self.catalogue_selection < create_index => {
+                if let Some(name) = self
+                    .cfg
+                    .catalogues
+                    .keys()
+                    .nth(self.catalogue_selection)
+                    .cloned()
+                {
                     self.selected_catalogue = Some(name);
                     self.confirm_action = 0;
                     self.status = None;
                     self.screen = Screen::Confirm;
                 }
             }
+            KeyCode::Enter if self.catalogue_selection == create_index => {
+                self.reset_catalogue_form();
+                self.screen = Screen::CatalogueCreate;
+            }
+            KeyCode::Enter => self.screen = Screen::SourceSelect,
             _ => {}
         }
     }
 
     async fn on_key_confirm(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.screen = Screen::SourceSelect,
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Esc => self.screen = Screen::CatalogueSelect,
+            KeyCode::Up => {
                 self.confirm_action = self.confirm_action.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.confirm_action = (self.confirm_action + 1).min(3);
+            KeyCode::Down => {
+                self.confirm_action = (self.confirm_action + 1).min(2);
+            }
+            KeyCode::Left if self.confirm_action == 1 => {
+                self.cfg.filters.raw_mode = previous_raw_mode(self.cfg.filters.raw_mode);
+            }
+            KeyCode::Right if self.confirm_action == 1 => {
+                self.cfg.filters.raw_mode = next_raw_mode(self.cfg.filters.raw_mode);
             }
             KeyCode::Enter => match self.confirm_action {
                 0 => {
                     if self.cfg.filters.raw_mode != self.raw_mode_disk {
+                        self.save_action = 0;
                         self.screen = Screen::SaveConfigPrompt;
                     } else {
                         self.start_scan();
                     }
                 }
-                1 => self.screen = Screen::CatalogueSelect,
-                2 => {
-                    self.cfg.filters.raw_mode = match self.cfg.filters.raw_mode {
-                        RawMode::All => RawMode::RawOnly,
-                        RawMode::RawOnly => RawMode::NonRawOnly,
-                        RawMode::NonRawOnly => RawMode::All,
-                    };
-                }
-                _ => self.screen = Screen::SourceSelect,
+                2 => self.screen = Screen::CatalogueSelect,
+                _ => {}
             },
             _ => {}
         }
@@ -815,71 +800,89 @@ impl App {
                 self.status = None;
                 self.screen = Screen::CatalogueSelect;
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.select_catalogue_field(self.catalogue_field.next())
+            KeyCode::Down => {
+                self.select_catalogue_create_item(self.catalogue_create_item.next());
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.select_catalogue_field(self.catalogue_field.prev())
+            KeyCode::Up => {
+                self.select_catalogue_create_item(self.catalogue_create_item.prev());
             }
             KeyCode::Left => self.move_catalogue_cursor_left(),
             KeyCode::Right => self.move_catalogue_cursor_right(),
-            KeyCode::Enter => self.try_create_catalogue(),
+            KeyCode::Enter if self.catalogue_create_item == CatalogueCreateItem::Create => {
+                self.try_create_catalogue();
+            }
+            KeyCode::Enter if self.catalogue_create_item == CatalogueCreateItem::Back => {
+                self.reset_catalogue_form();
+                self.status = None;
+                self.screen = Screen::CatalogueSelect;
+            }
             KeyCode::Backspace => self.delete_before_catalogue_cursor(),
             KeyCode::Delete => self.delete_at_catalogue_cursor(),
-            KeyCode::Char(c) => self.insert_at_catalogue_cursor(c),
+            KeyCode::Char(character) => self.insert_at_catalogue_cursor(character),
             _ => {}
         }
     }
 
-    fn catalogue_buffer_mut(&mut self) -> &mut String {
-        match self.catalogue_field {
-            CatalogueField::Name => &mut self.catalogue_name,
-            CatalogueField::ImagesRoot => &mut self.catalogue_images_root,
-            CatalogueField::VideosRoot => &mut self.catalogue_videos_root,
-            CatalogueField::ImagesTemplate => &mut self.catalogue_images_template,
-            CatalogueField::VideosTemplate => &mut self.catalogue_videos_template,
+    fn catalogue_buffer_mut(&mut self) -> Option<&mut String> {
+        match self.catalogue_create_item {
+            CatalogueCreateItem::Name => Some(&mut self.catalogue_name),
+            CatalogueCreateItem::ImagesRoot => Some(&mut self.catalogue_images_root),
+            CatalogueCreateItem::VideosRoot => Some(&mut self.catalogue_videos_root),
+            CatalogueCreateItem::ImagesTemplate => Some(&mut self.catalogue_images_template),
+            CatalogueCreateItem::VideosTemplate => Some(&mut self.catalogue_videos_template),
+            CatalogueCreateItem::Create | CatalogueCreateItem::Back => None,
         }
     }
 
-    fn select_catalogue_field(&mut self, field: CatalogueField) {
-        self.catalogue_field = field;
-        self.catalogue_cursor = self.catalogue_buffer_mut().len();
+    fn select_catalogue_create_item(&mut self, item: CatalogueCreateItem) {
+        self.catalogue_create_item = item;
+        self.catalogue_cursor = match item {
+            CatalogueCreateItem::Name => self.catalogue_name.len(),
+            CatalogueCreateItem::ImagesRoot => self.catalogue_images_root.len(),
+            CatalogueCreateItem::VideosRoot => self.catalogue_videos_root.len(),
+            CatalogueCreateItem::ImagesTemplate => self.catalogue_images_template.len(),
+            CatalogueCreateItem::VideosTemplate => self.catalogue_videos_template.len(),
+            CatalogueCreateItem::Create | CatalogueCreateItem::Back => 0,
+        };
     }
 
     fn move_catalogue_cursor_left(&mut self) {
         let cursor = self.catalogue_cursor;
-        let next = {
-            let value = self.catalogue_buffer_mut();
-            value[..cursor]
-                .char_indices()
-                .last()
-                .map_or(0, |(index, _)| index)
+        let Some(value) = self.catalogue_buffer_mut() else {
+            return;
         };
-        self.catalogue_cursor = next;
+        self.catalogue_cursor = value[..cursor]
+            .char_indices()
+            .last()
+            .map_or(0, |(index, _)| index);
     }
 
     fn move_catalogue_cursor_right(&mut self) {
         let cursor = self.catalogue_cursor;
-        let next = {
-            let value = self.catalogue_buffer_mut();
-            if cursor < value.len() {
-                cursor + value[cursor..].chars().next().unwrap().len_utf8()
-            } else {
-                cursor
-            }
+        let Some(value) = self.catalogue_buffer_mut() else {
+            return;
         };
-        self.catalogue_cursor = next;
+        self.catalogue_cursor = if cursor < value.len() {
+            cursor + value[cursor..].chars().next().unwrap().len_utf8()
+        } else {
+            cursor
+        };
     }
 
     fn insert_at_catalogue_cursor(&mut self, character: char) {
         let cursor = self.catalogue_cursor;
-        self.catalogue_buffer_mut().insert(cursor, character);
+        let Some(value) = self.catalogue_buffer_mut() else {
+            return;
+        };
+        value.insert(cursor, character);
         self.catalogue_cursor += character.len_utf8();
     }
 
     fn delete_before_catalogue_cursor(&mut self) {
         let cursor = self.catalogue_cursor;
-        let value = self.catalogue_buffer_mut();
+        let Some(value) = self.catalogue_buffer_mut() else {
+            return;
+        };
         if let Some((start, _)) = value[..cursor].char_indices().last() {
             value.drain(start..cursor);
             self.catalogue_cursor = start;
@@ -888,7 +891,9 @@ impl App {
 
     fn delete_at_catalogue_cursor(&mut self) {
         let cursor = self.catalogue_cursor;
-        let value = self.catalogue_buffer_mut();
+        let Some(value) = self.catalogue_buffer_mut() else {
+            return;
+        };
         if cursor < value.len() {
             let end = cursor + value[cursor..].chars().next().unwrap().len_utf8();
             value.drain(cursor..end);
@@ -901,7 +906,7 @@ impl App {
         self.catalogue_videos_root.clear();
         self.catalogue_images_template = "{yyyy}/{yyyy}-{mm}-{dd}".into();
         self.catalogue_videos_template = "{yyyy}/{yyyy}-{mm}-{dd}".into();
-        self.catalogue_field = CatalogueField::Name;
+        self.catalogue_create_item = CatalogueCreateItem::Name;
         self.catalogue_cursor = 0;
     }
 
@@ -933,36 +938,39 @@ impl App {
             .position(|name| name == &key)
             .unwrap_or(0);
         self.reset_catalogue_form();
-        self.catalogue_list_state.select(Some(index));
+        self.catalogue_selection = index;
         self.status = Some(format!("saved catalogue \"{key}\""));
         self.screen = Screen::CatalogueSelect;
     }
 
     fn on_key_save_prompt(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.screen = Screen::Confirm,
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Esc => {
+                self.confirm_action = 0;
+                self.screen = Screen::Confirm;
+            }
+            KeyCode::Up => {
                 self.save_action = self.save_action.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.save_action = (self.save_action + 1).min(1);
+            KeyCode::Down => {
+                self.save_action = (self.save_action + 1).min(2);
+            }
+            KeyCode::Enter if self.save_action == 0 => match self.cfg.save(&self.cfg_path) {
+                Ok(()) => {
+                    self.status = Some(format!("saved config to {}", self.cfg_path.display()));
+                    self.raw_mode_disk = self.cfg.filters.raw_mode;
+                    self.start_scan();
+                }
+                Err(error) => self.status = Some(format!("save failed: {error}")),
+            },
+            KeyCode::Enter if self.save_action == 1 => {
+                self.status = Some("using values for this session only".into());
+                self.raw_mode_disk = self.cfg.filters.raw_mode;
+                self.start_scan();
             }
             KeyCode::Enter => {
-                if self.save_action == 0 {
-                    match self.cfg.save(&self.cfg_path) {
-                        Ok(()) => {
-                            self.status =
-                                Some(format!("saved config to {}", self.cfg_path.display()));
-                            self.raw_mode_disk = self.cfg.filters.raw_mode;
-                        }
-                        Err(error) => self.status = Some(format!("save failed: {error}")),
-                    }
-                } else {
-                    self.status = Some("using values for this session only".into());
-                    self.raw_mode_disk = self.cfg.filters.raw_mode;
-                }
+                self.confirm_action = 0;
                 self.screen = Screen::Confirm;
-                self.start_scan();
             }
             _ => {}
         }
@@ -970,8 +978,14 @@ impl App {
 
     fn on_key_scan(&mut self, key: KeyEvent) {
         if self.scan_error.is_some() {
-            self.reset_for_new_run();
-        } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.scan_cancelling {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                self.reset_for_new_run();
+            }
+            return;
+        }
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+            && !self.scan_cancelling
+        {
             if let Some(cancellation) = &self.scan_cancellation {
                 cancellation.cancel();
                 self.scan_cancelling = true;
@@ -981,51 +995,41 @@ impl App {
     }
 
     async fn on_key_review(&mut self, key: KeyEvent) {
-        let n = self
+        let item_count = self
             .plan
             .as_ref()
-            .map(|p| build_review_tree(p).len())
+            .map(|plan| build_review_items(plan).len())
             .unwrap_or(0);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.reset_for_new_run();
-            }
-            KeyCode::Tab => self.review_actions_focused = !self.review_actions_focused,
-            KeyCode::Down | KeyCode::Char('j') if self.review_actions_focused => {
+            KeyCode::Char('q') | KeyCode::Esc => self.reset_for_new_run(),
+            KeyCode::Down => {
                 self.review_action = (self.review_action + 1).min(2);
             }
-            KeyCode::Up | KeyCode::Char('k') if self.review_actions_focused => {
+            KeyCode::Up => {
                 self.review_action = self.review_action.saturating_sub(1);
             }
-            KeyCode::Enter if self.review_actions_focused => match self.review_action {
+            KeyCode::Enter => match self.review_action {
                 0 => self.start_sync(false),
                 1 => self.start_sync(true),
-                _ => {
-                    self.reset_for_new_run();
-                }
+                _ => self.reset_for_new_run(),
             },
-            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
-                let i = self.review_state.selected().unwrap_or(0);
-                self.review_state.select(Some((i + 1).min(n - 1)));
+            KeyCode::PageDown if item_count > 0 => {
+                let index = self.review_state.selected().unwrap_or(0);
+                self.review_state
+                    .select(Some((index + 10).min(item_count - 1)));
             }
-            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
-                let i = self.review_state.selected().unwrap_or(0);
-                self.review_state.select(Some(i.saturating_sub(1)));
-            }
-            KeyCode::PageDown if n > 0 => {
-                let i = self.review_state.selected().unwrap_or(0);
-                self.review_state.select(Some((i + 10).min(n - 1)));
-            }
-            KeyCode::PageUp if n > 0 => {
-                let i = self.review_state.selected().unwrap_or(0);
-                self.review_state.select(Some(i.saturating_sub(10)));
+            KeyCode::PageUp if item_count > 0 => {
+                let index = self.review_state.selected().unwrap_or(0);
+                self.review_state.select(Some(index.saturating_sub(10)));
             }
             _ => {}
         }
     }
 
     fn on_key_sync(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.sync_cancelling {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q'))
+            && !self.sync_cancelling
+        {
             if let Some(cancellation) = &self.sync_cancellation {
                 cancellation.cancel();
                 self.sync_cancelling = true;
@@ -1036,20 +1040,14 @@ impl App {
 
     fn on_key_summary(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.summary_action = self.summary_action.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.summary_action = (self.summary_action + 1).min(1);
             }
-            KeyCode::Enter => {
-                if self.summary_action == 0 {
-                    self.reset_for_new_run();
-                } else {
-                    self.should_quit = true;
-                }
-            }
-            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Enter if self.summary_action == 0 => self.reset_for_new_run(),
+            KeyCode::Enter | KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
     }
@@ -1079,6 +1077,9 @@ impl App {
         self.dry_run = false;
         self.status = None;
         self.mounts = detect_mounts();
+        self.source_selection = 0;
+        self.manual_editing = false;
+        self.summary_action = 1;
     }
 
     // -----------------------------------------------------------------------
@@ -1182,16 +1183,15 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn render(&mut self, f: &mut Frame) {
-        let area = f.area();
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // header
-                Constraint::Min(3),    // body
-                Constraint::Length(1), // status
-                Constraint::Length(1), // help
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
-            .split(area);
+            .split(f.area());
 
         self.render_header(f, rows[0]);
         match self.screen {
@@ -1210,38 +1210,36 @@ impl App {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let mut title = match self.screen {
-            Screen::SourceSelect => "select source",
-            Screen::CatalogueSelect => "select catalogue",
-            Screen::CatalogueCreate => "create catalogue",
-            Screen::SaveConfigPrompt => "save to config?",
-            Screen::Confirm => "confirm",
-            Screen::Scan => "scanning",
-            Screen::Review => "review plan",
-            Screen::Sync if self.dry_run => "syncing (dry run)",
-            Screen::Sync => "syncing",
-            Screen::Summary => "summary",
-        }
-        .to_string();
-        if matches!(
-            self.screen,
-            Screen::Scan | Screen::Review | Screen::Sync | Screen::Summary
-        ) {
-            if let Some(catalogue) = &self.selected_catalogue {
-                title.push_str(&format!("  ·  catalogue: {catalogue}"));
+        let current = match self.screen {
+            Screen::SourceSelect => 0,
+            Screen::CatalogueSelect | Screen::CatalogueCreate => 1,
+            Screen::Confirm | Screen::SaveConfigPrompt => 2,
+            Screen::Scan | Screen::Review => 3,
+            Screen::Sync | Screen::Summary => 4,
+        };
+        let stages = ["SOURCE", "CATALOGUE", "CONFIRM", "REVIEW", "IMPORT"];
+        let mut spans = vec![Span::styled(
+            " IMAGESYNC     ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        for (index, stage) in stages.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("  ─  ", Style::default().fg(Color::DarkGray)));
             }
-        }
-        let line = Line::from(vec![
-            Span::styled(
-                "imagesync",
+            let style = if index == current {
                 Style::default()
                     .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(title, Style::default().fg(Color::Yellow)),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if index < current {
+                Style::default().fg(Color::Gray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(*stage, style));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
@@ -1253,15 +1251,17 @@ impl App {
     }
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help = match self.screen {
-            Screen::SourceSelect => "Tab switch focus   ↑/↓ select   Enter activate   Esc quit",
-            Screen::CatalogueSelect => "↑/↓ select   Enter activate   Esc source",
-            Screen::CatalogueCreate => "Tab/↑↓ field   Enter save   Esc cancel",
-            Screen::SaveConfigPrompt => "↑/↓ select action   Enter activate   Esc cancel",
-            Screen::Confirm => "↑/↓ select action   Enter activate   Esc back   q quit",
-            Screen::Scan => "Esc cancel",
-            Screen::Review => "Tab switch focus   ↑/↓ select or scroll   Enter activate   Esc back",
-            Screen::Sync => "Esc abort",
-            Screen::Summary => "↑/↓ select action   Enter activate   Esc quit",
+            Screen::SourceSelect if self.manual_editing => "Enter accept   Esc cancel",
+            Screen::SourceSelect => "↑/↓ choose   Enter activate   Esc quit",
+            Screen::CatalogueSelect => "↑/↓ choose   Enter activate   Esc back",
+            Screen::CatalogueCreate => "↑/↓ choose   ←/→ move cursor   Enter activate   Esc back",
+            Screen::SaveConfigPrompt => "↑/↓ choose   Enter activate   Esc back",
+            Screen::Confirm => "↑/↓ choose   ←/→ change value   Enter activate   Esc back",
+            Screen::Scan if self.scan_error.is_some() => "Enter/Esc back",
+            Screen::Scan => "Enter/Esc cancel",
+            Screen::Review => "↑/↓ choose   PgUp/PgDn scroll preview   Enter activate   Esc back",
+            Screen::Sync => "Enter/Esc cancel",
+            Screen::Summary => "↑/↓ choose   Enter activate   Esc quit",
         };
         f.render_widget(
             Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1272,173 +1272,171 @@ impl App {
     // ------- Screen: SourceSelect -------
 
     fn render_source_select(&mut self, f: &mut Frame, area: Rect) {
-        let cols = Layout::default()
+        let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(3),
+                Constraint::Length(2),
+                Constraint::Min(10),
                 Constraint::Length(5),
             ])
             .split(area);
-
-        // List
-        let items: Vec<ListItem> = if self.mounts.is_empty() {
-            vec![ListItem::new(
-                "  (no mounts detected — press 'm' to enter a path manually)",
-            )]
-        } else {
-            self.mounts
-                .iter()
-                .map(|m| {
-                    let tag = match m.rank {
-                        MountRank::CameraCard => {
-                            Span::styled("[CAMERA]", Style::default().fg(Color::Green).bold())
-                        }
-                        MountRank::Removable => {
-                            Span::styled("[remov.]", Style::default().fg(Color::Cyan))
-                        }
-                        MountRank::Other => {
-                            Span::styled("[other ]", Style::default().fg(Color::DarkGray))
-                        }
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(" "),
-                        tag,
-                        Span::raw(" "),
-                        Span::raw(format!("{:<24}", trim_label(&m.label, 24))),
-                        Span::raw(" "),
-                        Span::styled(
-                            m.path.display().to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]))
-                })
-                .collect()
-        };
-
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" detected sources "),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
-        f.render_stateful_widget(list, cols[0], &mut self.sources_state);
-
-        let title = if self.manual_focused {
-            " manual path (Enter to accept, Tab actions) "
-        } else {
-            " manual path (Tab to edit) "
-        };
-        let style = if self.manual_focused {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let display = if self.manual_focused {
-            format!("{}_", self.manual_path)
-        } else {
-            self.manual_path.clone()
-        };
-        let para = Paragraph::new(display)
-            .style(style)
-            .block(Block::default().borders(Borders::ALL).title(title));
-        f.render_widget(para, cols[1]);
-
-        let actions = vec![
-            action_line(
-                self.source_actions_focused && self.source_action == 0,
-                "Enter a path manually",
-            ),
-            action_line(
-                self.source_actions_focused && self.source_action == 1,
-                "Refresh sources",
-            ),
-            action_line(
-                self.source_actions_focused && self.source_action == 2,
-                "Quit",
-            ),
-        ];
         f.render_widget(
-            Paragraph::new(actions)
-                .block(Block::default().borders(Borders::ALL).title(" actions ")),
-            cols[2],
+            Paragraph::new("Select a camera or storage device")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
+
+        let mut items = self
+            .mounts
+            .iter()
+            .map(|mount| {
+                let (kind, color) = match mount.rank {
+                    MountRank::CameraCard => ("CAMERA", Color::Green),
+                    MountRank::Removable => ("REMOVABLE", Color::Cyan),
+                    MountRank::Other => ("OTHER", Color::DarkGray),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<30}", trim_label(&mount.label, 30)),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(kind, Style::default().fg(color)),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        items.push(ListItem::new(""));
+        items.push(if self.manual_editing {
+            ListItem::new(Line::from(vec![
+                Span::styled("Enter a path…  ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{}_", self.manual_path),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]))
+        } else {
+            ListItem::new("Enter a path…")
+        });
+        items.push(ListItem::new("Refresh sources"));
+        items.push(ListItem::new(Line::styled(
+            "Quit",
+            Style::default().fg(Color::Red),
+        )));
+
+        let display_selection = if self.source_selection < self.mounts.len() {
+            self.source_selection
+        } else {
+            self.source_selection + 1
+        };
+        render_menu(f, rows[1], " Sources ", items, display_selection);
+
+        let details = if let Some(mount) = self.mounts.get(self.source_selection) {
+            let kind = match mount.rank {
+                MountRank::CameraCard => "Camera card",
+                MountRank::Removable => "Removable storage",
+                MountRank::Other => "Other mount",
+            };
+            vec![
+                Line::from(vec![
+                    Span::styled(" Type   ", Style::default().fg(Color::Cyan)),
+                    Span::raw(kind),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Path   ", Style::default().fg(Color::Cyan)),
+                    Span::raw(mount.path.display().to_string()),
+                ]),
+            ]
+        } else if self.source_selection == self.mounts.len() {
+            vec![Line::raw(
+                "Enter an absolute path to a mounted camera or storage directory.",
+            )]
+        } else if self.source_selection == self.mounts.len() + 1 {
+            vec![Line::raw("Rescan the system for mounted storage devices.")]
+        } else {
+            vec![Line::raw("Exit ImageSync.")]
+        };
+        f.render_widget(
+            Paragraph::new(details).block(panel(" Source details ", false)),
+            rows[2],
         );
     }
 
     // ------- Screens: CatalogueSelect and CatalogueCreate -------
 
     fn render_catalogue_select(&mut self, f: &mut Frame, area: Rect) {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(10),
+                Constraint::Length(7),
+            ])
             .split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Choose a catalogue",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "    Source: {}",
+                        self.chosen_label.as_deref().unwrap_or("(none)")
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            rows[0],
+        );
 
-        let mut items: Vec<ListItem> = self
+        let create_index = self.cfg.catalogues.len();
+        let back_index = create_index + 1;
+        let mut items = self
             .cfg
             .catalogues
             .keys()
             .map(|name| ListItem::new(name.clone()))
-            .collect();
-        items.push(ListItem::new(Span::styled(
-            "Create new catalogue",
+            .collect::<Vec<_>>();
+        items.push(ListItem::new(Line::styled(
+            "+ New catalogue…",
             Style::default().fg(Color::Green),
         )));
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" catalogues "))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▶ ");
-        f.render_stateful_widget(list, columns[0], &mut self.catalogue_list_state);
+        items.push(ListItem::new(""));
+        items.push(ListItem::new("Back"));
+        let display_selection = if self.catalogue_selection == back_index {
+            back_index + 1
+        } else {
+            self.catalogue_selection
+        };
+        render_menu(f, rows[1], " Catalogues ", items, display_selection);
 
-        let index = self.catalogue_list_state.selected().unwrap_or(0);
-        let preview = self
-            .cfg
-            .catalogues
-            .iter()
-            .nth(index)
-            .map(|(name, catalogue)| {
-                vec![
-                    Line::from(vec![
-                        Span::styled("Name: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(name),
-                    ]),
-                    Line::raw(""),
-                    Line::from(vec![
-                        Span::styled("Images root: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(catalogue.images_root.display().to_string()),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Images folders: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(catalogue.images_template.clone()),
-                    ]),
-                    Line::raw(""),
-                    Line::from(vec![
-                        Span::styled("Videos root: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(catalogue.videos_root.display().to_string()),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Videos folders: ", Style::default().fg(Color::Cyan)),
-                        Span::raw(catalogue.videos_template.clone()),
-                    ]),
-                ]
-            })
-            .unwrap_or_default();
+        let preview = if self.catalogue_selection < create_index {
+            self.cfg
+                .catalogues
+                .iter()
+                .nth(self.catalogue_selection)
+                .map(catalogue_details)
+                .unwrap_or_default()
+        } else if self.catalogue_selection == create_index {
+            vec![
+                Line::raw("Create another destination catalogue."),
+                Line::styled(
+                    "You will choose image/video roots and folder templates.",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]
+        } else {
+            self.selected_catalogue
+                .as_ref()
+                .and_then(|name| self.cfg.catalogues.get_key_value(name))
+                .map(catalogue_details)
+                .or_else(|| self.cfg.catalogues.iter().next().map(catalogue_details))
+                .unwrap_or_else(|| vec![Line::raw("Return to source selection.")])
+        };
         f.render_widget(
             Paragraph::new(preview)
-                .block(Block::default().borders(Borders::ALL).title(" routing "))
+                .block(panel(" Catalogue details ", false))
                 .wrap(Wrap { trim: false }),
-            columns[1],
+            rows[2],
         );
     }
 
@@ -1446,211 +1444,233 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
+                Constraint::Length(2),
+                Constraint::Length(10),
+                Constraint::Min(4),
             ])
             .split(area);
-
-        self.render_catalogue_field(
-            f,
+        f.render_widget(
+            Paragraph::new("Create a catalogue")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
             rows[0],
-            CatalogueField::Name,
-            " name ",
-            &self.catalogue_name,
         );
-        self.render_catalogue_field(
+
+        let items = vec![
+            ListItem::new(catalogue_field_line(
+                self.catalogue_create_item == CatalogueCreateItem::Name,
+                self.catalogue_cursor,
+                "Name",
+                &self.catalogue_name,
+            )),
+            ListItem::new(catalogue_field_line(
+                self.catalogue_create_item == CatalogueCreateItem::ImagesRoot,
+                self.catalogue_cursor,
+                "Images root",
+                &self.catalogue_images_root,
+            )),
+            ListItem::new(catalogue_field_line(
+                self.catalogue_create_item == CatalogueCreateItem::VideosRoot,
+                self.catalogue_cursor,
+                "Videos root",
+                &self.catalogue_videos_root,
+            )),
+            ListItem::new(catalogue_field_line(
+                self.catalogue_create_item == CatalogueCreateItem::ImagesTemplate,
+                self.catalogue_cursor,
+                "Images folders",
+                &self.catalogue_images_template,
+            )),
+            ListItem::new(catalogue_field_line(
+                self.catalogue_create_item == CatalogueCreateItem::VideosTemplate,
+                self.catalogue_cursor,
+                "Videos folders",
+                &self.catalogue_videos_template,
+            )),
+            ListItem::new(""),
+            ListItem::new(Line::styled(
+                "Create catalogue",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            ListItem::new("Back"),
+        ];
+        let display_selection = match self.catalogue_create_item {
+            CatalogueCreateItem::Create => 6,
+            CatalogueCreateItem::Back => 7,
+            item => item.index(),
+        };
+        render_menu(
             f,
             rows[1],
-            CatalogueField::ImagesRoot,
-            " images root ",
-            &self.catalogue_images_root,
+            " Catalogue fields and actions ",
+            items,
+            display_selection,
         );
-        self.render_catalogue_field(
-            f,
-            rows[2],
-            CatalogueField::VideosRoot,
-            " videos root ",
-            &self.catalogue_videos_root,
-        );
-        self.render_catalogue_field(
-            f,
-            rows[3],
-            CatalogueField::ImagesTemplate,
-            " images folder format ",
-            &self.catalogue_images_template,
-        );
-        self.render_catalogue_field(
-            f,
-            rows[4],
-            CatalogueField::VideosTemplate,
-            " videos folder format ",
-            &self.catalogue_videos_template,
-        );
-        f.render_widget(
-            Paragraph::new(
-                "Templates use tokens like {yyyy}, {mm}, {dd}, {month}, {HH}, {MM}, {SS}.",
-            )
-            .style(Style::default().fg(Color::DarkGray))
-            .wrap(Wrap { trim: false }),
-            rows[5],
-        );
-    }
 
-    fn render_catalogue_field(
-        &self,
-        f: &mut Frame,
-        area: Rect,
-        field: CatalogueField,
-        title: &str,
-        value: &str,
-    ) {
-        let focused = self.catalogue_field == field;
-        let style = if focused {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let display = if focused {
-            let cursor = self.catalogue_cursor.min(value.len());
-            format!("{}_{}", &value[..cursor], &value[cursor..])
-        } else {
-            value.to_string()
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(if focused {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            });
-        f.render_widget(Paragraph::new(display).style(style).block(block), area);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw("Typing edits the selected field. Left/Right moves its text cursor."),
+                Line::styled(
+                    "Folder tokens: {yyyy}, {mm}, {dd}, {month}, {HH}, {MM}, {SS}",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+            .block(panel(" Field help ", false))
+            .wrap(Wrap { trim: false }),
+            rows[2],
+        );
     }
 
     // ------- Screen: SaveConfigPrompt -------
 
     fn render_save_prompt(&self, f: &mut Frame, area: Rect) {
-        let body = vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Save this raw-mode setting to your config file?",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("  Path: ", Style::default().fg(Color::Cyan)),
-                Span::raw(self.cfg_path.display().to_string()),
-            ]),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("  Raw mode: ", Style::default().fg(Color::Cyan)),
-                Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
-            ]),
-            Line::raw(""),
-            action_line(self.save_action == 0, "Save to config"),
-            action_line(self.save_action == 1, "Use this session only"),
-        ];
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(6),
+                Constraint::Min(5),
+            ])
+            .split(area);
         f.render_widget(
-            Paragraph::new(body)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" save raw mode? "),
-                )
-                .wrap(Wrap { trim: false }),
-            area,
+            Paragraph::new("Save this RAW setting?")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
+        let actions = vec![
+            ListItem::new(Line::styled(
+                "Save to config",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            ListItem::new("Use this session only"),
+            ListItem::new(""),
+            ListItem::new("Back"),
+        ];
+        render_menu(
+            f,
+            rows[1],
+            " Actions ",
+            actions,
+            [0, 1, 3][self.save_action],
+        );
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(" Config path   ", Style::default().fg(Color::Cyan)),
+                    Span::raw(self.cfg_path.display().to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled(" RAW files     ", Style::default().fg(Color::Cyan)),
+                    Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
+                ]),
+            ])
+            .block(panel(" Setting details ", false))
+            .wrap(Wrap { trim: false }),
+            rows[2],
         );
     }
 
     // ------- Screen: Confirm -------
 
     fn render_confirm(&self, f: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Min(9),
+            ])
+            .split(area);
+        f.render_widget(
+            Paragraph::new("Confirm import").style(Style::default().add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
+        let raw_focused = self.confirm_action == 1;
+        let actions = vec![
+            ListItem::new(Line::styled(
+                "Scan & review",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            ListItem::new(Line::from(vec![
+                Span::raw("RAW files    "),
+                cycle_value(raw_mode_label(self.cfg.filters.raw_mode), raw_focused),
+                Span::styled("    ←/→ change", Style::default().fg(Color::DarkGray)),
+            ])),
+            ListItem::new(""),
+            ListItem::new("Back"),
+        ];
+        render_menu(
+            f,
+            rows[1],
+            " Actions ",
+            actions,
+            [0, 1, 3][self.confirm_action],
+        );
+
         let catalogue_name = self.selected_catalogue.as_deref().unwrap_or("(none)");
         let catalogue = self
             .selected_catalogue
             .as_ref()
             .and_then(|name| self.cfg.catalogues.get(name));
-        let body = vec![
+        let details = vec![
             Line::from(vec![
-                Span::styled("Source: ", Style::default().fg(Color::Cyan)),
+                Span::styled(" Source      ", Style::default().fg(Color::Cyan)),
                 Span::raw(
+                    self.chosen_label
+                        .as_deref()
+                        .unwrap_or_else(|| self.chosen_source.as_ref().map_or("", |_| "(source)")),
+                ),
+            ]),
+            Line::styled(
+                format!(
+                    "             {}",
                     self.chosen_source
                         .as_ref()
                         .map(|path| path.display().to_string())
-                        .unwrap_or_default(),
+                        .unwrap_or_default()
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("Profile: ", Style::default().fg(Color::Cyan)),
-                Span::raw(self.detected_profile_name.clone().unwrap_or_default()),
-            ]),
-            Line::from(vec![
-                Span::styled("Catalogue: ", Style::default().fg(Color::Cyan)),
-                Span::raw(catalogue_name),
-            ]),
+                Style::default().fg(Color::DarkGray),
+            ),
             Line::raw(""),
             Line::from(vec![
-                Span::styled("Images root: ", Style::default().fg(Color::Cyan)),
-                Span::raw(
+                Span::styled(" Catalogue   ", Style::default().fg(Color::Cyan)),
+                Span::raw(catalogue_name),
+            ]),
+            Line::styled(
+                format!(
+                    " Images      {} / {}",
                     catalogue
                         .map(|value| value.images_root.display().to_string())
                         .unwrap_or_default(),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Images folders: ", Style::default().fg(Color::Cyan)),
-                Span::raw(
                     catalogue
-                        .map(|value| value.images_template.clone())
-                        .unwrap_or_default(),
+                        .map(|value| value.images_template.as_str())
+                        .unwrap_or_default()
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("Videos root: ", Style::default().fg(Color::Cyan)),
-                Span::raw(
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::styled(
+                format!(
+                    " Videos      {} / {}",
                     catalogue
                         .map(|value| value.videos_root.display().to_string())
                         .unwrap_or_default(),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Videos folders: ", Style::default().fg(Color::Cyan)),
-                Span::raw(
                     catalogue
-                        .map(|value| value.videos_template.clone())
-                        .unwrap_or_default(),
+                        .map(|value| value.videos_template.as_str())
+                        .unwrap_or_default()
                 ),
-            ]),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("Raw mode: ", Style::default().fg(Color::Cyan)),
-                Span::raw(raw_mode_label(self.cfg.filters.raw_mode)),
-                Span::styled(
-                    "   (select the action below to change)",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            Line::raw(""),
-            action_line(self.confirm_action == 0, "Scan and review"),
-            action_line(self.confirm_action == 1, "Change catalogue"),
-            action_line(
-                self.confirm_action == 2,
-                &format!(
-                    "Change RAW mode ({})",
-                    raw_mode_label(self.cfg.filters.raw_mode)
-                ),
+                Style::default().fg(Color::DarkGray),
             ),
-            action_line(self.confirm_action == 3, "Change source"),
         ];
         f.render_widget(
-            Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title(" confirm "))
+            Paragraph::new(details)
+                .block(panel(" Import details ", false))
                 .wrap(Wrap { trim: false }),
-            area,
+            rows[2],
         );
     }
 
@@ -1660,153 +1680,115 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(2),
                 Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
+                Constraint::Min(5),
             ])
             .split(area);
+        f.render_widget(
+            Paragraph::new("Planning import").style(Style::default().add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
 
-        if let Some(err) = &self.scan_error {
-            let status = Paragraph::new("scan failed")
-                .style(Style::default().fg(Color::Red).bold())
-                .block(Block::default().borders(Borders::ALL).title(" status "));
-            f.render_widget(status, rows[0]);
+        let action = if self.scan_error.is_some() {
+            ListItem::new("Back to source")
+        } else if self.scan_cancelling {
+            ListItem::new(Line::styled(
+                "Cancelling scan…",
+                Style::default().fg(Color::DarkGray),
+            ))
+        } else {
+            ListItem::new(Line::styled("Cancel scan", Style::default().fg(Color::Red)))
+        };
+        render_menu(f, rows[1], " Actions ", vec![action], 0);
 
-            let body = Paragraph::new(err.clone())
-                .style(Style::default().fg(Color::Red))
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" error — press any key to go back "),
-                );
-            f.render_widget(body, rows[1].union(rows[2]));
+        if let Some(error) = &self.scan_error {
+            f.render_widget(
+                Paragraph::new(error.clone())
+                    .style(Style::default().fg(Color::Red))
+                    .wrap(Wrap { trim: false })
+                    .block(panel(" Scan failed ", false)),
+                rows[2],
+            );
             return;
         }
 
-        let status = Paragraph::new(self.scan_status.clone())
-            .block(Block::default().borders(Borders::ALL).title(" status "));
-        f.render_widget(status, rows[0]);
-
-        // The scan phase only lists files and builds the plan — no EXIF here
-        // (capture dates are read later, on the local copies, during sync).
-        let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" planning "))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(if self.scan_files_total > 0 { 1.0 } else { 0.0 })
-            .label("building plan…");
-        f.render_widget(gauge, rows[1]);
-
-        let info = Paragraph::new(format!("{} files enumerated.", self.scan_files_total))
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL));
-        f.render_widget(info, rows[2]);
+        let details = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(3),
+            ])
+            .split(rows[2]);
+        f.render_widget(
+            Paragraph::new(self.scan_status.clone()).block(panel(" Status ", false)),
+            details[0],
+        );
+        f.render_widget(
+            Gauge::default()
+                .block(panel(" Planning ", false))
+                .gauge_style(Style::default().fg(Color::Cyan))
+                .ratio(if self.scan_files_total > 0 { 1.0 } else { 0.0 })
+                .label("building plan…"),
+            details[1],
+        );
+        f.render_widget(
+            Paragraph::new(format!("{} files enumerated.", self.scan_files_total))
+                .style(Style::default().fg(Color::DarkGray))
+                .block(panel(" Scan details ", false)),
+            details[2],
+        );
     }
 
     // ------- Screen: Review -------
 
     fn render_review(&mut self, f: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .constraints([Constraint::Length(7), Constraint::Min(3)])
-            .split(area);
-        let top = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(32), Constraint::Min(20)])
-            .split(rows[0]);
-
         let plan = match &self.plan {
-            Some(p) => p,
+            Some(plan) => plan,
             None => return,
         };
-        let action_border = if self.review_actions_focused {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(6),
+                Constraint::Min(5),
+            ])
+            .split(area);
+        f.render_widget(
+            Paragraph::new("Ready to import").style(Style::default().add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
         let actions = vec![
-            action_line(
-                self.review_actions_focused && self.review_action == 0,
-                "Start import",
-            ),
-            action_line(
-                self.review_actions_focused && self.review_action == 1,
-                "Dry run",
-            ),
-            action_line(
-                self.review_actions_focused && self.review_action == 2,
-                "Back",
-            ),
+            ListItem::new(Line::styled(
+                format!("Import {} files", plan.copies()),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            ListItem::new("Dry run"),
+            ListItem::new(""),
+            ListItem::new("Back"),
         ];
-        f.render_widget(
-            Paragraph::new(actions).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" actions ")
-                    .border_style(action_border),
-            ),
-            top[0],
+        render_menu(
+            f,
+            rows[1],
+            " Actions ",
+            actions,
+            [0, 1, 3][self.review_action],
         );
 
-        let summary = vec![
-            Line::from(vec![
-                Span::styled("Copies: ", Style::default().fg(Color::Green).bold()),
-                Span::raw(plan.copies().to_string()),
-                Span::raw("    "),
-                Span::styled("Skips: ", Style::default().fg(Color::Cyan)),
-                Span::raw(plan.skips().to_string()),
-                Span::raw("    "),
-                Span::styled("Errors: ", Style::default().fg(Color::Red)),
-                Span::raw(plan.errors().to_string()),
-            ]),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Destination folders resolve during import; this is a provisional source-file list.",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "Tab switches between actions and preview.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        f.render_widget(
-            Paragraph::new(summary).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" plan ")
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-            top[1],
-        );
-
-        let items = build_review_tree(plan);
+        let items = build_review_items(plan);
         let item_count = items.len();
-        let preview_border = if self.review_actions_focused {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::Yellow)
-        };
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(
-                        " provisional preview ({} new files) ",
-                        plan.copies()
-                    ))
-                    .border_style(preview_border),
-            )
-            .highlight_style(if self.review_actions_focused {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default().bg(Color::Blue).fg(Color::White)
-            });
-        f.render_stateful_widget(list, rows[1], &mut self.review_state);
-        if item_count > rows[1].height.saturating_sub(2) as usize {
+        let list = List::new(items).block(panel(" Import preview ", false));
+        f.render_stateful_widget(list, rows[2], &mut self.review_state);
+        if item_count > rows[2].height.saturating_sub(2) as usize {
             let mut scrollbar_state =
                 ScrollbarState::new(item_count).position(self.review_state.selected().unwrap_or(0));
             f.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                rows[1],
+                rows[2],
                 &mut scrollbar_state,
             );
         }
@@ -1815,15 +1797,43 @@ impl App {
     // ------- Screen: Sync -------
 
     fn render_sync(&self, f: &mut Frame, area: Rect) {
-        // Decide how many lanes we can fit. Each lane needs 3 rows
-        // (border + bar + border). Total gauge takes 3, log needs at
-        // least 3.
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Min(6),
+            ])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(if self.dry_run {
+                "Checking import (dry run)"
+            } else {
+                "Importing files"
+            })
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+            outer[0],
+        );
+        let action = if self.sync_cancelling {
+            ListItem::new(Line::styled(
+                "Cancelling import…",
+                Style::default().fg(Color::DarkGray),
+            ))
+        } else {
+            ListItem::new(Line::styled(
+                "Cancel import",
+                Style::default().fg(Color::Red),
+            ))
+        };
+        render_menu(f, outer[1], " Actions ", vec![action], 0);
+
+        let body_area = outer[2];
         let lanes_requested = self.sync_slots.len();
-        let max_fit = (area.height as usize).saturating_sub(3 + 3) / 3;
+        let max_fit = (body_area.height as usize).saturating_sub(3 + 3) / 3;
         let lanes_visible = lanes_requested.min(max_fit).max(1);
         let lanes_hidden = lanes_requested.saturating_sub(lanes_visible);
 
-        let mut constraints: Vec<Constraint> = Vec::with_capacity(lanes_visible + 2);
+        let mut constraints = Vec::with_capacity(lanes_visible + 2);
         constraints.push(Constraint::Length(3));
         for _ in 0..lanes_visible {
             constraints.push(Constraint::Length(3));
@@ -1832,12 +1842,10 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
-            .split(area);
+            .split(body_area);
 
-        // Progress tracks files that required import work. Runtime skips are
-        // reported separately and never make the import bar appear complete.
         let completed = self.sync_progress.copied + self.sync_progress.failed;
-        let pct = if self.sync_copy_total > 0 {
+        let percentage = if self.sync_copy_total > 0 {
             (completed as f64 / self.sync_copy_total as f64).min(1.0)
         } else {
             1.0
@@ -1852,54 +1860,56 @@ impl App {
         if lanes_hidden > 0 {
             total_label.push_str(&format!(" · +{lanes_hidden} more lanes hidden"));
         }
-        let total_gauge = Gauge::default()
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if self.dry_run {
-                        " progress (dry run) "
+        f.render_widget(
+            Gauge::default()
+                .block(panel(
+                    if self.dry_run {
+                        " Progress (dry run) "
                     } else {
-                        " progress "
-                    }),
-            )
-            .gauge_style(Style::default().fg(Color::Green))
-            .ratio(pct)
-            .label(total_label);
-        f.render_widget(total_gauge, rows[0]);
+                        " Progress "
+                    },
+                    false,
+                ))
+                .gauge_style(Style::default().fg(Color::Green))
+                .ratio(percentage)
+                .label(total_label),
+            rows[0],
+        );
 
-        for i in 0..lanes_visible {
-            let lane_area = rows[1 + i];
-            let title = format!(" worker {} ", i + 1);
-            let (lane_pct, lane_label) = match self.sync_slots.get(i).and_then(|slot| slot.as_ref())
-            {
-                Some(slot) if slot.bytes_total > 0 => (
-                    (slot.bytes_done as f64 / slot.bytes_total as f64).min(1.0),
-                    format!(
-                        "{} — {}  {}/{}",
-                        slot.rel_path,
-                        file_phase_label(slot.phase),
-                        human_bytes(slot.bytes_done),
-                        human_bytes(slot.bytes_total)
+        for index in 0..lanes_visible {
+            let title = format!(" Worker {} ", index + 1);
+            let (lane_percentage, lane_label) =
+                match self.sync_slots.get(index).and_then(|slot| slot.as_ref()) {
+                    Some(slot) if slot.bytes_total > 0 => (
+                        (slot.bytes_done as f64 / slot.bytes_total as f64).min(1.0),
+                        format!(
+                            "{} — {}  {}/{}",
+                            slot.rel_path,
+                            file_phase_label(slot.phase),
+                            human_bytes(slot.bytes_done),
+                            human_bytes(slot.bytes_total)
+                        ),
                     ),
-                ),
-                Some(slot) => (
-                    0.0,
-                    format!("{} — {}", slot.rel_path, file_phase_label(slot.phase)),
-                ),
-                None => (0.0, "(idle)".to_string()),
-            };
-            let gauge = Gauge::default()
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .gauge_style(Style::default().fg(Color::Cyan))
-                .ratio(lane_pct)
-                .label(lane_label);
-            f.render_widget(gauge, lane_area);
+                    Some(slot) => (
+                        0.0,
+                        format!("{} — {}", slot.rel_path, file_phase_label(slot.phase)),
+                    ),
+                    None => (0.0, "(idle)".to_string()),
+                };
+            f.render_widget(
+                Gauge::default()
+                    .block(panel(title, false))
+                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .ratio(lane_percentage)
+                    .label(lane_label),
+                rows[1 + index],
+            );
         }
 
         let log_area = rows[1 + lanes_visible];
         let log_height = log_area.height.saturating_sub(2) as usize;
         let first_line = self.sync_log.len().saturating_sub(log_height);
-        let body: Vec<Line> = self.sync_log[first_line..]
+        let body = self.sync_log[first_line..]
             .iter()
             .map(|line| {
                 let style = if line.contains("FAIL") || line.contains("ERROR") {
@@ -1913,9 +1923,9 @@ impl App {
                 };
                 Line::styled(line.clone(), style)
             })
-            .collect();
+            .collect::<Vec<_>>();
         f.render_widget(
-            Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(" log ")),
+            Paragraph::new(body).block(panel(" Recent activity ", false)),
             log_area,
         );
     }
@@ -1923,73 +1933,92 @@ impl App {
     // ------- Screen: Summary -------
 
     fn render_summary(&self, f: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(4),
+                Constraint::Min(6),
+            ])
+            .split(area);
         let summary = self.sync_summary.unwrap_or_default();
         let (heading, heading_color) = if let Some(error) = &self.sync_error {
-            (format!("Sync did not complete: {error}"), Color::Red)
+            (format!("Import did not complete: {error}"), Color::Red)
         } else if summary.cancelled {
-            (
-                "Sync cancelled — core-reported partial results below.".into(),
-                Color::Yellow,
-            )
+            ("Import cancelled".into(), Color::Yellow)
         } else if self.dry_run {
-            (
-                "Dry run complete. No files were written.".into(),
-                Color::Green,
-            )
+            ("Dry run complete".into(), Color::Green)
         } else {
-            ("Sync complete.".into(), Color::Green)
+            ("Import complete".into(), Color::Green)
         };
-        let mut body = vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                heading,
-                Style::default().fg(heading_color).bold(),
-            )),
-            Line::raw(""),
-        ];
+        f.render_widget(
+            Paragraph::new(heading).style(
+                Style::default()
+                    .fg(heading_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[0],
+        );
+        render_menu(
+            f,
+            rows[1],
+            " Actions ",
+            vec![
+                ListItem::new(Line::styled(
+                    "Import another source",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                ListItem::new("Quit"),
+            ],
+            self.summary_action,
+        );
+
+        let mut details = Vec::new();
+        if self.dry_run && self.sync_error.is_none() && !summary.cancelled {
+            details.push(Line::raw("No files were written."));
+            details.push(Line::raw(""));
+        }
         if self.sync_summary.is_some() {
-            body.extend([
+            details.extend([
                 Line::from(vec![
-                    Span::styled("Completed: ", Style::default().fg(Color::Cyan)),
+                    Span::styled(" Completed   ", Style::default().fg(Color::Cyan)),
                     Span::raw(format!("{}/{}", summary.completed(), summary.total)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Copied:    ", Style::default().fg(Color::Green)),
+                    Span::styled(" Copied      ", Style::default().fg(Color::Green)),
                     Span::raw(summary.copied.to_string()),
                 ]),
                 Line::from(vec![
-                    Span::styled("Skipped:   ", Style::default().fg(Color::Cyan)),
+                    Span::styled(" Skipped     ", Style::default().fg(Color::Cyan)),
                     Span::raw(summary.skipped.to_string()),
                 ]),
                 Line::from(vec![
-                    Span::styled("Failed:    ", Style::default().fg(Color::Red)),
+                    Span::styled(" Failed      ", Style::default().fg(Color::Red)),
                     Span::raw(summary.failed.to_string()),
                 ]),
             ]);
         }
         if !self.sync_diagnostics.is_empty() {
-            body.push(Line::raw(""));
-            body.push(Line::from(Span::styled(
-                "Warnings and errors:",
-                Style::default().fg(Color::Yellow),
-            )));
-            body.extend(
+            details.push(Line::raw(""));
+            details.push(Line::styled(
+                "Warnings and errors",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            details.extend(
                 self.sync_diagnostics
                     .iter()
                     .map(|diagnostic| Line::raw(diagnostic.clone())),
             );
         }
-        body.push(Line::raw(""));
-        body.push(action_line(
-            self.summary_action == 0,
-            "Import another source",
-        ));
-        body.push(action_line(self.summary_action == 1, "Quit"));
         f.render_widget(
-            Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title(" done "))
+            Paragraph::new(details)
+                .block(panel(" Summary ", false))
                 .wrap(Wrap { trim: false }),
-            area,
+            rows[2],
         );
     }
 }
@@ -1997,6 +2026,77 @@ impl App {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn panel(title: impl Into<String>, active: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title.into())
+        .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }))
+}
+
+fn render_menu<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    title: impl Into<String>,
+    items: Vec<ListItem<'a>>,
+    selected_display_row: usize,
+) {
+    let mut state = ListState::default();
+    state.select(Some(selected_display_row));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(panel(title, true))
+            .highlight_symbol("› ")
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        area,
+        &mut state,
+    );
+}
+fn catalogue_field_line(focused: bool, cursor: usize, label: &str, value: &str) -> Line<'static> {
+    let mut shown = value.to_string();
+    if focused {
+        shown.insert(cursor, '_');
+    }
+    Line::from(vec![
+        Span::styled(format!("{label:<16}"), Style::default().fg(Color::Cyan)),
+        Span::raw(shown),
+    ])
+}
+
+fn catalogue_details((name, catalogue): (&String, &CatalogueConfig)) -> Vec<Line<'static>> {
+    vec![
+        Line::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Line::from(vec![
+            Span::styled(" Images   ", Style::default().fg(Color::Cyan)),
+            Span::raw(catalogue.images_root.display().to_string()),
+        ]),
+        Line::styled(
+            format!("           {}", catalogue.images_template),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::from(vec![
+            Span::styled(" Videos   ", Style::default().fg(Color::Cyan)),
+            Span::raw(catalogue.videos_root.display().to_string()),
+        ]),
+        Line::styled(
+            format!("           {}", catalogue.videos_template),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+fn cycle_value(value: &str, focused: bool) -> Span<'static> {
+    Span::styled(
+        format!("‹ {value} ›"),
+        Style::default().fg(if focused { Color::Black } else { Color::Yellow }),
+    )
+}
 
 fn push_log(buf: &mut Vec<String>, s: String) {
     const MAX: usize = 500;
@@ -2041,22 +2141,59 @@ fn trim_label(s: &str, max: usize) -> String {
     }
 }
 
-fn action_line(selected: bool, label: &str) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
-    let style = if selected {
-        Style::default().bg(Color::Blue).fg(Color::White)
-    } else {
-        Style::default()
-    };
-    Line::from(Span::styled(format!("{marker}{label}"), style))
-}
-
 fn raw_mode_label(m: RawMode) -> &'static str {
     match m {
         RawMode::All => "All (RAW + JPEG)",
         RawMode::RawOnly => "RAW only",
         RawMode::NonRawOnly => "Non-RAW only",
     }
+}
+fn previous_raw_mode(mode: RawMode) -> RawMode {
+    match mode {
+        RawMode::All => RawMode::NonRawOnly,
+        RawMode::RawOnly => RawMode::All,
+        RawMode::NonRawOnly => RawMode::RawOnly,
+    }
+}
+
+fn next_raw_mode(mode: RawMode) -> RawMode {
+    match mode {
+        RawMode::All => RawMode::RawOnly,
+        RawMode::RawOnly => RawMode::NonRawOnly,
+        RawMode::NonRawOnly => RawMode::All,
+    }
+}
+
+fn build_review_items(plan: &SyncPlan) -> Vec<ListItem<'static>> {
+    let mut items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled(" Copy      ", Style::default().fg(Color::Green)),
+            Span::raw(format!(
+                "{} files · {}",
+                plan.copies(),
+                human_bytes(
+                    plan.items
+                        .iter()
+                        .filter(|item| item.action == PlannedAction::Copy)
+                        .map(|item| item.source_size)
+                        .sum()
+                )
+            )),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled(" Skip      ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} files", plan.skips())),
+        ])),
+        ListItem::new(""),
+        ListItem::new(Line::styled(
+            "Planned source groups",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    items.extend(build_review_tree(plan));
+    items
 }
 
 /// Build the grouped tree view of files that would be copied: one section
@@ -2257,7 +2394,7 @@ mod tests {
         assert_eq!(app.screen, Screen::SourceSelect);
         app.choose_source(source);
         assert_eq!(app.screen, Screen::CatalogueSelect);
-        assert_eq!(app.catalogue_list_state.selected(), Some(0));
+        assert_eq!(app.catalogue_selection, 0);
         assert!(app.selected_catalogue.is_none());
     }
 
@@ -2346,7 +2483,7 @@ mod tests {
         app.try_create_catalogue();
 
         assert_eq!(app.screen, Screen::CatalogueSelect);
-        assert_eq!(app.catalogue_list_state.selected(), Some(0));
+        assert_eq!(app.catalogue_selection, 0);
         assert!(app.selected_catalogue.is_none());
         assert_eq!(
             AppConfig::load_or_default(&config_path)
@@ -2360,7 +2497,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Confirm);
         assert_eq!(app.selected_catalogue.as_deref(), Some("Photos"));
 
-        app.confirm_action = 1;
+        app.confirm_action = 2;
         app.on_key_confirm(key(KeyCode::Enter)).await;
         assert_eq!(app.screen, Screen::CatalogueSelect);
         assert_eq!(app.selected_catalogue.as_deref(), Some("Photos"));
@@ -2373,5 +2510,43 @@ mod tests {
         assert!(app.selected_catalogue.is_none());
         assert!(app.plan.is_none());
         assert!(app.plan_source.is_none());
+    }
+    #[tokio::test]
+    async fn confirm_value_changes_only_with_horizontal_arrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path().join("config.toml"));
+        app.screen = Screen::Confirm;
+        app.confirm_action = 1;
+
+        app.on_key_confirm(key(KeyCode::Enter)).await;
+        assert_eq!(app.cfg.filters.raw_mode, RawMode::All);
+        assert_eq!(app.screen, Screen::Confirm);
+
+        app.on_key_confirm(key(KeyCode::Right)).await;
+        assert_eq!(app.cfg.filters.raw_mode, RawMode::RawOnly);
+        app.on_key_confirm(key(KeyCode::Left)).await;
+        assert_eq!(app.cfg.filters.raw_mode, RawMode::All);
+    }
+
+    #[test]
+    fn catalogue_fields_are_edited_without_entering_a_focus_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path().join("config.toml"));
+        app.screen = Screen::CatalogueCreate;
+
+        app.on_key_catalogue_create(key(KeyCode::Char('P')));
+        app.on_key_catalogue_create(key(KeyCode::Enter));
+        app.on_key_catalogue_create(key(KeyCode::Char('h')));
+
+        assert_eq!(app.catalogue_name, "Ph");
+        assert_eq!(app.screen, Screen::CatalogueCreate);
+    }
+
+    #[test]
+    fn summary_defaults_to_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path().join("config.toml"));
+
+        assert_eq!(app.summary_action, 1);
     }
 }
