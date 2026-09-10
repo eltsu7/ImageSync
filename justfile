@@ -3,6 +3,9 @@ set shell := ["bash", "-uc"]
 test_root := justfile_directory() + "/.test"
 test_mount_root := test_root + "/mounts"
 
+install:
+    cargo install --path crates/imagesync-cli --locked --force
+
 test-input-refresh input:
     rm -rf "{{test_root}}/input"
     mkdir -p "{{test_root}}/input/DCIM"
